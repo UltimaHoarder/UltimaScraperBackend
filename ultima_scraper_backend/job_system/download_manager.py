@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ from ultima_scraper_api import user_types
 from ultima_scraper_core.concurrency import map_unordered
 
 from ultima_scraper_backend.config import (
+    StagingDirectory,
     StagingPolicy,
     StagingUsage,
     UltimaScraperCollectionConfig,
@@ -49,6 +51,7 @@ ProgressCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 CompleteCallback = Callable[[Path], None]  # (filepath)
 ErrorCallback = Callable[[Exception, str], None]  # (error, url)
 StatusCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
+DownloadedCallback = Callable[["DownloadItem"], None]
 
 
 @dataclass
@@ -61,6 +64,7 @@ class DownloadWorkspace:
         default_factory=lambda: cast(list[StagingUsage], [])
     )
     staging_fallback_reason: str | None = None
+    reserved_bytes: int = 0
 
     @property
     def work_directory(self) -> Path | None:
@@ -343,6 +347,48 @@ def _free_space_bytes(path: Path) -> int:
     return shutil.disk_usage(_resolve_disk_usage_path(path)).free
 
 
+@functools.cache
+def _is_tmpfs(path: Path) -> bool:
+    resolved = os.path.realpath(_resolve_disk_usage_path(path))
+    best_mount, best_type = "", ""
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as mounts:
+            for line in mounts:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                mount_point = fields[1].replace("\\040", " ")
+                inside = resolved == mount_point or resolved.startswith(
+                    mount_point.rstrip("/") + "/"
+                )
+                if inside and len(mount_point) >= len(best_mount):
+                    best_mount, best_type = mount_point, fields[2]
+    except OSError:
+        return False
+    return best_type in ("tmpfs", "ramfs")
+
+
+def _memory_available_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _staging_free_bytes(path: Path) -> int:
+    free = _free_space_bytes(path)
+    # A tmpfs reports its size cap, not the RAM left to back it.
+    if _is_tmpfs(path):
+        available = _memory_available_bytes()
+        if available is not None:
+            free = min(free, available)
+    return free
+
+
 def _move_file_sync(src: Path, dest: Path) -> None:
     if src == dest:
         return
@@ -424,6 +470,11 @@ class DownloadManager:
         self.on_complete: list[CompleteCallback] = []
         self.on_error: list[ErrorCallback] = []
         self.on_status: list[StatusCallback] = []
+        # Called per successful item; a registered hook owns its staging release.
+        self.on_downloaded: list[DownloadedCallback] = []
+
+        # Bytes promised to in-flight items, keyed by staging directory path.
+        self._staging_reserved: dict[Path, int] = {}
 
     async def _notify_progress(self, payload: dict[str, Any]) -> None:
         """Invoke registered progress callbacks with the provided payload."""
@@ -565,9 +616,17 @@ class DownloadManager:
         self._transferred_bytes += max(int(chunk_size), 0)
         await self._emit_transfer_progress(item, status="progress")
 
+    def _staging_headroom_bytes(self, directory: StagingDirectory) -> int:
+        return (
+            _staging_free_bytes(directory.path)
+            - directory.min_free_bytes
+            - self._staging_reserved.get(directory.path, 0)
+        )
+
     def _select_staging_directory(
         self,
         required_operations: list[StagingUsage],
+        needed_bytes: int = 0,
     ) -> tuple[Path | None, str | None]:
         staging_directories = list(
             self.config.settings.download_setup.staging_directories
@@ -596,16 +655,25 @@ class DownloadManager:
                 f"No staging directory matched required operations: {required_names}",
             )
 
-        best_directory = max(
-            matching_directories,
-            key=lambda directory: _free_space_bytes(directory.path),
-        )
+        for directory in matching_directories:
+            if StagingPolicy.PREFER not in directory.policy:
+                continue
+            if self._staging_headroom_bytes(directory) >= needed_bytes:
+                return directory.path, None
+
+        fallback_directories = [
+            directory
+            for directory in matching_directories
+            if StagingPolicy.PREFER not in directory.policy
+        ] or matching_directories
+        best_directory = max(fallback_directories, key=self._staging_headroom_bytes)
         return best_directory.path, None
 
     def _prepare_item_workspace(
         self,
         item: DownloadItem,
         required_operations: list[StagingUsage],
+        needed_bytes: int = 0,
     ) -> Path:
         workspace = item.drm_media_settings
         workspace.required_operations = list(required_operations)
@@ -614,10 +682,15 @@ class DownloadManager:
             return workspace.work_directory
 
         selected_directory, warning = self._select_staging_directory(
-            required_operations
+            required_operations, needed_bytes
         )
         if selected_directory is not None:
             workspace.work_directory = selected_directory
+            if needed_bytes > 0:
+                workspace.reserved_bytes = needed_bytes
+                self._staging_reserved[selected_directory] = (
+                    self._staging_reserved.get(selected_directory, 0) + needed_bytes
+                )
             return selected_directory
 
         workspace.staging_fallback_reason = warning
@@ -628,6 +701,19 @@ class DownloadManager:
                 warning,
             )
         return item.get_filepath().parent
+
+    def release_workspace(self, item: DownloadItem) -> None:
+        """Return the item's staging reservation once its files have left."""
+        workspace = item.drm_media_settings
+        directory = workspace.selected_staging_directory
+        if not workspace.reserved_bytes or directory is None:
+            return
+        remaining = self._staging_reserved.get(directory, 0) - workspace.reserved_bytes
+        if remaining > 0:
+            self._staging_reserved[directory] = remaining
+        else:
+            self._staging_reserved.pop(directory, None)
+        workspace.reserved_bytes = 0
 
     async def _finalize_workspace_file(
         self,
@@ -963,15 +1049,6 @@ class DownloadManager:
         item: DownloadItem,
     ) -> bool:
         logger.info(f"[DRM] Downloading encrypted streams for media {item.media_id}")
-        drm_work_directory = self._prepare_item_workspace(
-            item,
-            [
-                StagingUsage.DOWNLOADS,
-                StagingUsage.DRM,
-                StagingUsage.MERGE,
-            ],
-        )
-
         media_metadata = item.media_metadata
         drm_media = media_metadata.drm_media if media_metadata is not None else None
         user = item.user
@@ -1018,9 +1095,6 @@ class DownloadManager:
             logger.error("[DRM] No DRM streams resolved for media %s", item.media_id)
             return await self._fail_download(item)
 
-        item.drm_media_settings.drm_temp_directory = drm_work_directory
-        drm_work_directory.mkdir(parents=True, exist_ok=True)
-
         stream_items: dict[str, DownloadItem] = {}
         for stream_type, stream_url in available_streams.items():
             stream_ext = (
@@ -1028,42 +1102,58 @@ class DownloadManager:
                 if stream_type == "audio" and "video" not in available_streams
                 else "mp4"
             )
-            enc_path = (
-                drm_work_directory / f"{dest_path.stem}_{stream_type}.enc.{stream_ext}"
-            )
             stream_item = DownloadItem(
                 user=user,
                 url=stream_url,
-                filename=enc_path.name,
-                directory=drm_work_directory,
+                filename=f"{dest_path.stem}_{stream_type}.enc.{stream_ext}",
                 headers={"Cookie": cookies},
                 media_metadata=media_metadata,
             )
-            stream_item.drm_media_settings.work_directory = drm_work_directory
             stream_items[stream_type] = stream_item
 
+        downloaded = False
         try:
             stream_type_by_index = list(stream_items)
-            async with asyncio.TaskGroup() as preparations:
-                prepared_tasks = [
-                    preparations.create_task(self.prepare_download(stream_item))
+            async with asyncio.TaskGroup() as heads:
+                head_tasks = [
+                    heads.create_task(self.head_request(stream_item))
                     for stream_item in stream_items.values()
                 ]
-            prepared_streams = [task.result() for task in prepared_tasks]
-            stream_plans: dict[str, tuple[DownloadItem, int, int, Path]] = {}
-            for stream_type, prepared_stream in zip(
-                stream_type_by_index, prepared_streams, strict=False
+            stream_sizes: dict[str, int] = {}
+            for stream_type, head_task in zip(
+                stream_type_by_index, head_tasks, strict=False
             ):
-                if prepared_stream is False:
+                head_response = head_task.result()
+                if not head_response:
                     logger.error(
                         "[DRM] Failed to prepare %s stream for media %s",
                         stream_type,
                         item.media_id,
                     )
                     return await self._fail_download(item)
+                stream_sizes[stream_type] = int(head_response.content_length or 0)
 
+            # Encrypted and decrypted copies coexist during decrypt and merge.
+            drm_work_directory = self._prepare_item_workspace(
+                item,
+                [
+                    StagingUsage.DOWNLOADS,
+                    StagingUsage.DRM,
+                    StagingUsage.MERGE,
+                ],
+                needed_bytes=2 * sum(stream_sizes.values()),
+            )
+            item.drm_media_settings.drm_temp_directory = drm_work_directory
+            drm_work_directory.mkdir(parents=True, exist_ok=True)
+
+            stream_plans: dict[str, tuple[DownloadItem, int, int, Path]] = {}
+            for stream_type in stream_type_by_index:
                 stream_item = stream_items[stream_type]
-                file_size, num_parts, workspace_target = prepared_stream
+                stream_item.directory = drm_work_directory
+                stream_item.drm_media_settings.work_directory = drm_work_directory
+                file_size, num_parts, workspace_target = self._plan_download(
+                    stream_item, stream_sizes[stream_type]
+                )
                 assert stream_item.media_metadata is not None
                 assert stream_item.media_metadata.drm_media is not None
                 if stream_type == "video":
@@ -1152,28 +1242,35 @@ class DownloadManager:
             item.drm_media_settings.drm_video_path = resolved_paths.get("video")
             item.drm_media_settings.drm_audio_path = resolved_paths.get("audio")
             total_size = sum(path.stat().st_size for path in resolved_paths.values())
-            return await self._complete_download(item, total_size)
+            downloaded = await self._complete_download(item, total_size)
+            return downloaded
         finally:
             for stream_item in stream_items.values():
                 self._finish_item_progress(stream_item)
+            # Decryption still needs the staged streams after a success.
+            if not downloaded:
+                self.release_workspace(item)
 
     async def prepare_download(
         self, item: DownloadItem
     ) -> tuple[int, int, Path] | Literal[False]:
-        dest_path = item.get_filepath()
         head_response = await self.head_request(item)
         if not head_response:
             logger.error(f"Failed to get file info for {item.url}")
             return False
+        return self._plan_download(item, head_response.content_length or item.size or 0)
 
-        file_size = head_response.content_length or item.size or 0
+    def _plan_download(self, item: DownloadItem, file_size: int) -> tuple[int, int, Path]:
+        dest_path = item.get_filepath()
         if file_size == 0:
             logger.warning(f"File size unknown for {item.url}")
         item.size = file_size
         self._record_expected_bytes(item, file_size)
         num_parts = self.calculate_parts(file_size) if file_size > 0 else 1
         required_operations = self._get_required_operations(item, num_parts)
-        workspace_directory = self._prepare_item_workspace(item, required_operations)
+        workspace_directory = self._prepare_item_workspace(
+            item, required_operations, needed_bytes=file_size
+        )
         workspace_target = workspace_directory / dest_path.name
         return file_size, num_parts, workspace_target
 
@@ -1182,20 +1279,23 @@ class DownloadManager:
         item: DownloadItem,
     ) -> bool:
         dest_path = item.get_filepath()
-        prepared_download = await self.prepare_download(item)
-        if not prepared_download:
-            return await self._fail_download(item)
-        file_size, num_parts, workspace_target = prepared_download
+        try:
+            prepared_download = await self.prepare_download(item)
+            if not prepared_download:
+                return await self._fail_download(item)
+            file_size, num_parts, workspace_target = prepared_download
 
-        workspace_result = await self._download_to_workspace(
-            item,
-            file_size,
-            num_parts,
-            workspace_target,
-        )
-        if workspace_result is False:
-            return await self._fail_download(item)
-        await self._finalize_workspace_file(workspace_result, dest_path)
+            workspace_result = await self._download_to_workspace(
+                item,
+                file_size,
+                num_parts,
+                workspace_target,
+            )
+            if workspace_result is False:
+                return await self._fail_download(item)
+            await self._finalize_workspace_file(workspace_result, dest_path)
+        finally:
+            self.release_workspace(item)
         final_size = dest_path.stat().st_size
         item.size = final_size
         item.downloaded_this_run = True
@@ -1287,9 +1387,15 @@ class DownloadManager:
                 self.total += 1
             self._begin_item_progress(item, expected_precounted=known_items is not None)
             try:
-                return await self.download(item)
+                downloaded = await self.download(item)
             finally:
                 self._finish_item_progress(item)
+            if downloaded and self.on_downloaded:
+                for callback in list(self.on_downloaded):
+                    callback(item)
+            else:
+                self.release_workspace(item)
+            return downloaded
 
         session_created = False
         try:

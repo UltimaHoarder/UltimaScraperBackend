@@ -625,9 +625,6 @@ async def _download_content_batch(
 
     download_manager.on_status.append(emit_status)
 
-    # Execute bulk download
-    stats = await download_manager.bulk_download(valid_items, create_session=True)
-
     async def emit_drm_progress(drm_event: dict[str, Any]) -> None:
         drm_stage = str(drm_event.get("stage") or "progress")
         drm_processed = max(0, int(drm_event.get("current") or 0))
@@ -686,10 +683,11 @@ async def _download_content_batch(
             total=total_count,
         )
 
-    # Handle DRM decryption
-    await _process_drm_items(
+    # Download, decrypting each DRM item as soon as its streams are staged
+    stats = await _run_download_pipeline(
+        download_manager,
         valid_items,
-        on_progress=emit_drm_progress,
+        on_drm_progress=emit_drm_progress,
     )
 
     # Clean up progress callbacks
@@ -1181,53 +1179,87 @@ def _build_filepath_rows(
     return rows_to_insert
 
 
-async def _process_drm_items(
-    valid_items: list[DownloadItem],
-    on_progress: DRMProgressCallback | None = None,
-) -> None:
-    """Process DRM-protected items after download.
+class _DRMPipeline:
+    """Decrypts and merges each DRM item as soon as its streams are staged.
 
-    Decrypts and merges DRM-protected video/audio streams.
-    Updates item.size and the database with the real final file size
-    (which differs from the encrypted stream sizes).
-
-    Args:
-        valid_items: List of downloaded items to check for DRM
+    Items run concurrently; the media formatter's process slots bound the
+    CPU-heavy decrypt/merge work, while final moves overlap with it.
     """
-    drm_items = [
-        item
-        for item in valid_items
-        if item.media_metadata
-        and item.media_metadata.drm
-        and item.media_metadata.drm_key
-    ]
-    if not drm_items:
-        return
 
-    async def notify_drm_progress(
-        stage: str,
-        current: int,
+    def __init__(
+        self,
         total: int,
-        *,
-        item: DownloadItem | None = None,
+        on_progress: DRMProgressCallback | None = None,
+        release: Callable[[DownloadItem], None] | None = None,
     ) -> None:
-        if on_progress is None:
+        self.total = total
+        self.processed = 0
+        self.on_progress = on_progress
+        self.release = release
+        self._started = False
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def submit(self, item: DownloadItem) -> None:
+        if not (
+            item.media_metadata
+            and item.media_metadata.drm
+            and item.media_metadata.drm_key
+        ):
+            if self.release is not None:
+                self.release(item)
             return
-        await on_progress(
+        task = asyncio.create_task(self._run(item))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def cancel(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    async def finish(self) -> None:
+        try:
+            while self._tasks:
+                await asyncio.gather(*self._tasks)
+        except BaseException:
+            await self.cancel()
+            raise
+        if self._started:
+            logger.info(
+                f"[DRM] Completed decryption and merge for {self.processed} files"
+            )
+            await self._notify("finished")
+
+    async def _notify(self, stage: str, item: DownloadItem | None = None) -> None:
+        if self.on_progress is None:
+            return
+        await self.on_progress(
             {
                 "stage": stage,
-                "current": current,
-                "total": total,
+                "current": self.processed,
+                "total": self.total,
                 "media_id": item.media_id if item is not None else None,
                 "path": str(item.get_filepath()) if item is not None else None,
             }
         )
 
-    logger.info(f"[DRM] Decrypting {len(drm_items)} DRM-protected files")
-    drm_processed = 0
-    await notify_drm_progress("started", drm_processed, len(drm_items))
+    async def _run(self, item: DownloadItem) -> None:
+        if not self._started:
+            self._started = True
+            logger.info(f"[DRM] Decrypting up to {self.total} DRM-protected files")
+            await self._notify("started")
+        try:
+            succeeded = await self._process(item)
+        except Exception:
+            logger.exception(f"[DRM] Processing failed for media {item.media_id}")
+            succeeded = False
+        finally:
+            if self.release is not None:
+                self.release(item)
+        self.processed += 1
+        await self._notify("completed" if succeeded else "failed", item)
 
-    for item in drm_items:
+    async def _process(self, item: DownloadItem) -> bool:
         media_metadata = item.media_metadata
         assert media_metadata is not None, "DRM items must have media metadata"
         drm_key = media_metadata.drm_key
@@ -1241,27 +1273,18 @@ async def _process_drm_items(
             ]
             if x
         ]
-        dec_streams: list[Path] = []
         item_user = item.user
         authed = item_user.get_authed() if item_user is not None else None
         only_drm: OnlyDRM | None = getattr(authed, "drm", None)
 
         if not only_drm:
             logger.error(f"[DRM] DRM module not available for media {item.media_id}")
-            drm_processed += 1
-            await notify_drm_progress(
-                "failed", drm_processed, len(drm_items), item=item
-            )
-            continue
+            return False
 
         dest_path = item.get_filepath()
         if dest_path.exists():
             logger.info(f"[DRM] Final file already exists: {dest_path}")
-            drm_processed += 1
-            await notify_drm_progress(
-                "completed", drm_processed, len(drm_items), item=item
-            )
-            continue
+            return True
 
         drm_temp_directory = item.drm_media_settings.work_directory
         if drm_temp_directory is not None:
@@ -1271,16 +1294,20 @@ async def _process_drm_items(
         )
         temp_merge_target = _build_temp_merge_path(merge_target)
 
-        await notify_drm_progress(
-            "decrypting", drm_processed, len(drm_items), item=item
-        )
-        for stream in enc_streams:
-            logger.info(f"[DRM] Decrypting streams for media {item.media_id}")
-            dec_stream_filepath = await only_drm.decrypt_file_async(
-                stream,
-                drm_key,
-                temp_output_path=drm_temp_directory,
+        await self._notify("decrypting", item)
+        logger.info(f"[DRM] Decrypting streams for media {item.media_id}")
+        decrypted = await asyncio.gather(
+            *(
+                only_drm.decrypt_file_async(
+                    stream,
+                    drm_key,
+                    temp_output_path=drm_temp_directory,
+                )
+                for stream in enc_streams
             )
+        )
+        dec_streams: list[Path] = []
+        for dec_stream_filepath in decrypted:
             if dec_stream_filepath and dec_stream_filepath.exists():
                 logger.info(
                     f"[DRM] Decrypted stream created: {dec_stream_filepath} "
@@ -1292,38 +1319,72 @@ async def _process_drm_items(
         logger.info(
             f"[DRM] Merging streams for media {item.media_id} to {temp_merge_target}"
         )
-        await notify_drm_progress("merging", drm_processed, len(drm_items), item=item)
+        await self._notify("merging", item)
         success = await only_drm.merge_media(temp_merge_target, dec_streams)
 
-        if success and temp_merge_target.exists():
-            if merge_target != temp_merge_target:
-                await asyncio.to_thread(
-                    shutil.move, str(temp_merge_target), str(merge_target)
-                )
-            if merge_target != dest_path:
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(shutil.move, str(merge_target), str(dest_path))
-            final_size = dest_path.stat().st_size
-            item.downloaded_this_run = True
-            # Update item.size so _process_download_result doesn't flag a
-            # size mismatch (encrypted stream sizes != final muxed size).
-            item.size = final_size
-            logger.info(
-                f"[DRM] Successfully created {dest_path} ({final_size:,} bytes)"
-            )
-            drm_processed += 1
-            await notify_drm_progress(
-                "completed", drm_processed, len(drm_items), item=item
-            )
-        else:
+        if not (success and temp_merge_target.exists()):
             logger.error(f"[DRM] Merge failed for media {item.media_id}")
-            drm_processed += 1
-            await notify_drm_progress(
-                "failed", drm_processed, len(drm_items), item=item
+            return False
+        if merge_target != temp_merge_target:
+            await asyncio.to_thread(
+                shutil.move, str(temp_merge_target), str(merge_target)
             )
+        if merge_target != dest_path:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(shutil.move, str(merge_target), str(dest_path))
+        final_size = dest_path.stat().st_size
+        item.downloaded_this_run = True
+        # Update item.size so _process_download_result doesn't flag a
+        # size mismatch (encrypted stream sizes != final muxed size).
+        item.size = final_size
+        logger.info(f"[DRM] Successfully created {dest_path} ({final_size:,} bytes)")
+        return True
 
-    logger.info(f"[DRM] Completed decryption and merge for {len(drm_items)} files")
-    await notify_drm_progress("finished", drm_processed, len(drm_items))
+
+def _count_drm_items(items: list[DownloadItem]) -> int:
+    return sum(1 for item in items if item.media_metadata and item.media_metadata.drm)
+
+
+async def _process_drm_items(
+    valid_items: list[DownloadItem],
+    on_progress: DRMProgressCallback | None = None,
+) -> None:
+    """Process already-downloaded DRM items concurrently.
+
+    Decrypts and merges DRM-protected video/audio streams.
+    Updates item.size and the database with the real final file size
+    (which differs from the encrypted stream sizes).
+
+    Args:
+        valid_items: List of downloaded items to check for DRM
+    """
+    pipeline = _DRMPipeline(_count_drm_items(valid_items), on_progress)
+    for item in valid_items:
+        pipeline.submit(item)
+    await pipeline.finish()
+
+
+async def _run_download_pipeline(
+    download_manager: DownloadManager,
+    valid_items: list[DownloadItem],
+    on_drm_progress: DRMProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Download items and post-process each DRM item as soon as it lands."""
+    pipeline = _DRMPipeline(
+        _count_drm_items(valid_items),
+        on_drm_progress,
+        release=download_manager.release_workspace,
+    )
+    download_manager.on_downloaded.append(pipeline.submit)
+    try:
+        stats = await download_manager.bulk_download(valid_items, create_session=True)
+    except BaseException:
+        await pipeline.cancel()
+        raise
+    finally:
+        download_manager.on_downloaded.remove(pipeline.submit)
+    await pipeline.finish()
+    return stats
 
 
 async def _process_download_result(

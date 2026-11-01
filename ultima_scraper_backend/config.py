@@ -192,12 +192,16 @@ class StagingUsage(str, Enum):
 
 class StagingPolicy(str, Enum):
     DRM_ONLY = "drm_only"
+    # Tried in listed order while the item fits, before the most-free fallback.
+    PREFER = "prefer"
 
 
 class StagingDirectory(BaseModel):
     path: Path
     usage: list[StagingUsage] = Field(default_factory=list)
     policy: list[StagingPolicy] = Field(default_factory=list)
+    # Headroom never handed to staged files (tmpfs: keep RAM for the system).
+    min_free_bytes: int = Field(default=0, ge=0)
 
     @field_validator("path")
     @classmethod
@@ -657,14 +661,14 @@ class UltimaScraperCollectionConfig(BaseModel):
         metadata_setup: GlobalXPathSetup = Field(
             default_factory=lambda: GlobalXPathSetup(
                 directory_format=Path(
-                    "{site_name}/{first_letter}/{model_username}/Metadata"
+                    "{site_name}/{first_letter}/{user_username}/Metadata"
                 )
             )
         )
         download_setup: DownloadPathSetup = Field(
             default_factory=lambda: DownloadPathSetup(
                 directory_format=Path(
-                    "{site_name}/{first_letter}/{model_username}/{api_type}/{value}/{media_type}"
+                    "{site_name}/{first_letter}/{user_username}/{content_type}/{content_value}/{media_type}"
                 ),
                 filename_format=Path("{filename}.{ext}"),
             )

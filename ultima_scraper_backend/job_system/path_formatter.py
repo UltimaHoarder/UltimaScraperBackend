@@ -15,7 +15,19 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .metadata_models import MediaMetadata
 
-__all__ = ["FormatAttributes", "PathFormatter"]
+__all__ = ["FormatAttributes", "PathFormatter", "invalid_format_tokens"]
+
+# Older token names that saved formats may still use.
+LEGACY_FORMAT_TOKENS = {
+    "value": "content_value",
+    "api_type": "content_type",
+    "model_username": "user_username",
+    "filename": "media_filename",
+    "ext": "media_ext",
+    "text": "content_text",
+    "date": "content_date",
+}
+_FORMAT_TOKEN_PATTERN = re.compile(r"\{([^}]*)\}")
 
 
 class FormatAttributes:
@@ -65,10 +77,10 @@ class PathFormatter:
 
     Supports tokens like:
     - {site_name}: Site name (onlyfans, fansly, etc.)
-    - {model_username}: Creator username
+    - {user_username}: Creator username ({model_username} is the legacy name)
     - {first_letter}: First letter of username (for organization)
-    - {api_type}: Content type (Posts, Messages, Stories)
-    - {value}: Content ID
+    - {content_type}: Content type (Posts, Messages, Stories; legacy {api_type})
+    - {content_value}: Paid/Free bucket (legacy {value})
     - {media_type}: Media category (images, videos, audio)
     - {media_id}: Media ID
     - {content_id}: Content/post ID
@@ -89,7 +101,7 @@ class PathFormatter:
         Initialize path formatter.
 
         Args:
-            directory_format: Directory path template (e.g., "{site_name}/{model_username}/{api_type}")
+            directory_format: Directory path template (e.g., "{site_name}/{user_username}/{content_type}")
             filename_format: Filename template (e.g., "{filename}.{ext}")
             date_format: strftime format for {date} token
             text_length: Max length for {text} token
@@ -130,10 +142,13 @@ class PathFormatter:
         return {
             "site_name": site_name,
             "model_username": model_username,
+            "user_username": model_username,
             "first_letter": first_letter,
             "first_username_letter": first_letter,
             "api_type": api_type,
+            "content_type": api_type,
             "value": str(content_value),
+            "content_value": str(content_value),
             "media_type": media.media_type,
             "media_id": str(media.media_id),
             "content_id": str(media.content_id),
@@ -229,15 +244,7 @@ class PathFormatter:
         matches = re.findall(pattern, unformatted_path)
         formatted_path = unformatted_path
 
-        legacy_token_map = {
-            "value": "content_value",
-            "api_type": "content_type",
-            "model_username": "user_username",
-            "filename": "media_filename",
-            "ext": "media_ext",
-            "text": "content_text",
-            "date": "content_date",
-        }
+        legacy_token_map = LEGACY_FORMAT_TOKENS
         capitalize = {
             "first_username_letter",
             "content_type",
@@ -323,6 +330,7 @@ class PathFormatter:
             # Keep the database token canonical while rendering the desired
             # two-level folder structure for downloaded files.
             directory_tokens["api_type"] = "Archived/Posts"
+            directory_tokens["content_type"] = "Archived/Posts"
 
         try:
             directory_str = str(self.directory_format).format(**directory_tokens)
@@ -350,3 +358,13 @@ class PathFormatter:
             )
 
         return self._format_media_path(*args, **kwargs)
+
+
+def invalid_format_tokens(template: str) -> list[str]:
+    """Return the {tokens} in a format template that the formatter cannot render."""
+    valid = set(FormatAttributes.get_all_keys()) | set(LEGACY_FORMAT_TOKENS)
+    invalid: list[str] = []
+    for token in _FORMAT_TOKEN_PATTERN.findall(template):
+        if token not in valid and token not in invalid:
+            invalid.append(token)
+    return invalid

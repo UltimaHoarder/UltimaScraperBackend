@@ -51,6 +51,7 @@ from ultima_scraper_backend.storage_config_propagation import (
     propagate_storage_config,
 )
 
+from ...job_system.path_formatter import invalid_format_tokens
 from ...services.settings_service import SECRET_MASK, SettingsService
 from ..dependencies import get_backend_instance
 
@@ -449,12 +450,40 @@ async def update_runtime_redis_settings(redis: RedisConfig) -> SettingsResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _validate_format_tokens(raw_update: dict[str, Any]) -> None:
+    """Reject path formats that name a token the formatter cannot render."""
+    problems: list[str] = []
+    fields: list[str] = []
+    for section in ("download_setup", "metadata_setup"):
+        values = cast(dict[str, Any], raw_update.get(section) or {})
+        templates = [
+            (f"{section}.{key}", values[key])
+            for key in ("directory_format", "filename_format")
+            if values.get(key)
+        ]
+        templates += [
+            (f"{section}.alt_directory_formats", template)
+            for template in values.get("alt_directory_formats") or []
+        ]
+        for field, template in templates:
+            for token in invalid_format_tokens(str(template)):
+                problems.append(f"{{{token}}} is not a valid token in {field}")
+                if field not in fields:
+                    fields.append(field)
+    if problems:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "; ".join(problems) + ".", "format_fields": fields},
+        )
+
+
 def _apply_settings_update_to_config(
     config: UltimaScraperCollectionConfig,
     update: SettingsUpdateRequest,
 ) -> list[str]:
     settings = config.settings
     raw_update = update.model_dump(mode="json", exclude_unset=True)
+    _validate_format_tokens(raw_update)
 
     changed_sections: list[str] = []
 
@@ -1587,6 +1616,22 @@ async def get_remote_settings(
         )
 
 
+def _http_exception_message(exc: HTTPException) -> str:
+    """Flatten a structured error detail into one readable sentence."""
+    detail = exc.detail
+    if not isinstance(detail, dict):
+        return str(detail)
+    detail = cast(dict[str, Any], detail)
+    message = str(detail.get("message") or "Settings update failed")
+    if detail.get("current_version") is not None:
+        message += (
+            f" Reload to get version {detail['current_version']}, then save again."
+        )
+    if detail.get("fields"):
+        message += f" ({', '.join(map(str, detail['fields']))})"
+    return message
+
+
 @router.put("/{backend_id}", response_model=RemoteUpdateResponse)
 async def update_remote_settings(
     backend_id: str,
@@ -1620,7 +1665,7 @@ async def update_remote_settings(
             return RemoteUpdateResponse(
                 backend_id=backend_id,
                 success=False,
-                message=str(e.detail),
+                message=_http_exception_message(e),
             )
         except Exception as e:
             return RemoteUpdateResponse(
@@ -1747,6 +1792,12 @@ async def update_remote_settings(
             backend_id=backend_id,
             success=True,
             message=f"Settings updated successfully for backend '{backend_id}'",
+        )
+    except HTTPException as exc:
+        return RemoteUpdateResponse(
+            backend_id=backend_id,
+            success=False,
+            message=_http_exception_message(exc),
         )
     except ConfigVersionConflict as exc:
         return RemoteUpdateResponse(
