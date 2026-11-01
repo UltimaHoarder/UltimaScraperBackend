@@ -59,6 +59,8 @@ from ..database.write_queue import (
 from ..job_system import BackendRouter, JobManager
 from ..job_system import JobStorage as TaskJobStorage
 
+from ..job_system.host_capacity import apply_media_process_slots
+
 # Event-sourced system imports
 from ..job_system.event_log import (
     EventLog,
@@ -711,6 +713,8 @@ class Worker:
 
         # Store config reference
         self.config = config
+        # Before any media formatter exists: decrypt/merge sized to this host.
+        apply_media_process_slots()
 
         # UltimaScraperAPI instance (initialized in async initialize() method)
         self.ultima_scraper_api: Optional[UltimaScraperAPI] = None
@@ -895,6 +899,15 @@ class Worker:
                     f"[{self.worker_id}] Could not refresh config from database: {exc}. "
                     "Using config passed at construction time."
                 )
+
+            # Worker-only hosts run no API, so a worker issues the backend's peer
+            # token too: with it, files built here can go to the backend that keeps them.
+            try:
+                from .. import peer_tokens
+
+                await asyncio.to_thread(peer_tokens.ensure_own_token, worker_config.settings.get_backend_id())
+            except Exception as exc:
+                logger.warning(f"[{self.worker_id}] No peer token, so no handing files over: {exc}")
 
             # Initialize database managers FIRST (after backend has created databases)
             # This is done here (not in __init__) to avoid race condition with backend

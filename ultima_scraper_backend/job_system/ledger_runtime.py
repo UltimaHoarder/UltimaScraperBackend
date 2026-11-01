@@ -12,6 +12,13 @@ from datetime import UTC, datetime
 from sqlalchemy.exc import OperationalError
 
 from ..database.threads import run_database_call
+from .. import peer_tokens
+from ..cluster import get_cluster_id
+from ..offload.client import find_owners
+from .host_capacity import DOWNLOAD_CAPABILITY, DownloadAdmission
+
+# How long a check for a backend to keep downloads holds.
+OWNER_PROBE_SECONDS = 30.0
 from ..database.write_queue import stable_command_id
 from .ledger import Claim, ExecutionLedger, StaleAttempt, archive_parallel_passes
 from .models import Job, Task, TaskCancelled, TaskResult, TaskState
@@ -130,9 +137,44 @@ class LedgerRouterAdapter:
         self.pool, self.ledger = pool, ExecutionLedger()
         self.claims = {}
         pool._ledger_claims = self.claims
+        self.downloads = DownloadAdmission(lambda: pool.config.settings.download_setup)
+        self._owner_checked_at: float | None = None
+        self._owner_reachable = False
+
+    async def _owner_available(self) -> bool:
+        """Whether another backend could keep downloads built here (cached 30 s)."""
+        now = time.monotonic()
+        if self._owner_checked_at is not None and now - self._owner_checked_at < OWNER_PROBE_SECONDS:
+            return self._owner_reachable
+        self._owner_checked_at = now
+        redis = getattr(self.pool, "redis", None)
+        if redis is None or peer_tokens.own_token() is None:
+            self._owner_reachable = False
+            return False
+        try:
+            owners = await find_owners(
+                redis,
+                self_id=self.pool.config.settings.get_backend_id(),
+                cluster_id=await asyncio.to_thread(get_cluster_id),
+            )
+        except Exception:
+            logger.debug("Could not look for a backend to keep downloads", exc_info=True)
+            owners = []
+        self._owner_reachable = bool(owners)
+        return self._owner_reachable
+
+    async def offers_downloads(self) -> bool:
+        """Downloads only with room to spare, and somewhere to keep them."""
+        if not await asyncio.to_thread(self.downloads.has_headroom):
+            return False
+        if await asyncio.to_thread(self.downloads.drive_reachable):
+            return True
+        return await self._owner_available()
 
     async def claim_ready_tasks(self, backend_id, *, count):
         capabilities = [*self.pool.supported_sites, "api_commands"]
+        if await self.offers_downloads():
+            capabilities.append(DOWNLOAD_CAPABILITY)
         claims = []
         if self.pool.worker_count > 1 and self.pool.worker_index == 0:
             # Worker zero serves interactive commands first, then fills its

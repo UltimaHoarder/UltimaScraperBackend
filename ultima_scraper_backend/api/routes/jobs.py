@@ -1722,7 +1722,9 @@ async def _create_job(
     try:
         async with _prepare_created_job(request, backend, backend_manager, payloads) as prepared:
             job, tasks, site_name, input_count, task_types, build_tasks = prepared
-            if backend.redis and not backend.distributed_mode:
+            if request.backend_id:
+                job.metadata["dispatch_backend_id"] = request.backend_id
+            elif backend.redis and not backend.distributed_mode:
                 job.metadata["dispatch_backend_id"] = backend.instance_id
 
             if request.schedule:

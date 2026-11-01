@@ -12,6 +12,7 @@ the download process including:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import logging
@@ -50,6 +51,8 @@ from ...models import (
 )
 from ...payloads import DownloadTaskPayload
 from ..scrape.events import publish_hook_event
+from ....offload import placement
+from ....offload.client import OffloadError
 from .results import categorize_media_items, resolve_content_id
 from .types import MediaEntry
 from .utils import (
@@ -340,8 +343,13 @@ async def _download_content_batch(
     download_manager,
     aggregate,
     evidence_spec,
+    remote_store=None,
 ):
-    """Process one bounded metadata batch using the existing file/DRM pipeline."""
+    """Process one bounded metadata batch using the existing file/DRM pipeline.
+
+    With ``remote_store``, files are built under its local mirror and handed to
+    the backend that keeps them once each is finished.
+    """
     user_id, site_name = int(user.id), task.site_name
     written = []
     bytes_written = 0
@@ -362,6 +370,7 @@ async def _download_content_batch(
         failures=construction_failures,
         directory_format_override=destination_selection.directory_format,
         render_full_directory_format=destination_selection.requires_full_directory_render,
+        download_setup=config.settings.download_setup,
     )
 
     # Categorize media items by expiry status
@@ -688,6 +697,7 @@ async def _download_content_batch(
         download_manager,
         valid_items,
         on_drm_progress=emit_drm_progress,
+        remote_store=remote_store,
     )
 
     # Clean up progress callbacks
@@ -701,6 +711,16 @@ async def _download_content_batch(
     download_results = list(skipped_items)
 
     async def finalize_item(item):
+        if item.offloaded_path is not None:
+            # Decrypted and kept by the owner: nothing of it is here to check.
+            written.append({"path": item.offloaded_path, "bytes": item.size or 0, "skipped": False})
+            return DownloadResultItem(
+                media_id=item.media_id or 0,
+                content_id=resolve_content_id(item),
+                status="downloaded",
+                path=item.offloaded_path,
+                bytes_written=item.size or 0,
+            )
         return await _process_download_result(item, written)
 
     async with aclosing(
@@ -712,6 +732,8 @@ async def _download_content_batch(
     ) as results:
         async for result in results:
             download_results.append(result)
+    if remote_store is not None:
+        await _hand_over(remote_store, download_results)
     bytes_written = sum(
         r.bytes_written or 0 for r in download_results if r.status == "downloaded"
     )
@@ -965,6 +987,7 @@ def _build_download_items(
     failures: list[DownloadResultItem] | None = None,
     directory_format_override: Path | None = None,
     render_full_directory_format: bool = False,
+    download_setup: Any | None = None,
 ) -> list[DownloadItem]:
     """Build deduplicated download items and apply fresh URLs from scrape output.
 
@@ -985,6 +1008,7 @@ def _build_download_items(
                     base_directory=base_destination,
                     directory_format_override=directory_format_override,
                     render_full_directory_format=render_full_directory_format,
+                    download_setup=download_setup,
                 )
             except ValueError as exc:
                 if failures is not None:
@@ -1191,8 +1215,12 @@ class _DRMPipeline:
         total: int,
         on_progress: DRMProgressCallback | None = None,
         release: Callable[[DownloadItem], None] | None = None,
+        remote_store: Any = None,
     ) -> None:
         self.total = total
+        # With a backend that keeps the files, the placement rule may give it the work.
+        self.remote_store = remote_store
+        self._owner_capacity: tuple[float, Any] | None = None
         self.processed = 0
         self.on_progress = on_progress
         self.release = release
@@ -1277,15 +1305,88 @@ class _DRMPipeline:
         authed = item_user.get_authed() if item_user is not None else None
         only_drm: OnlyDRM | None = getattr(authed, "drm", None)
 
-        if not only_drm:
-            logger.error(f"[DRM] DRM module not available for media {item.media_id}")
-            return False
-
         dest_path = item.get_filepath()
         if dest_path.exists():
             logger.info(f"[DRM] Final file already exists: {dest_path}")
             return True
 
+        stream_bytes = sum(stream.stat().st_size for stream in enc_streams if stream.exists())
+        if self.remote_store is not None and await self._owner_decrypts(
+            stream_bytes, can_decrypt_here=only_drm is not None
+        ):
+            return await self._decrypt_on_owner(item, enc_streams, drm_key, dest_path)
+
+        if not only_drm:
+            logger.error(f"[DRM] DRM module not available for media {item.media_id}")
+            return False
+
+        started = placement.meter.started()
+        succeeded = False
+        try:
+            succeeded = await self._decrypt_here(item, enc_streams, drm_key, dest_path, only_drm)
+        finally:
+            placement.meter.finished(started, stream_bytes, succeeded)
+        return succeeded
+
+    async def _owner_capacity_now(self) -> Any:
+        """The owner's throughput and queue, asked at most every 10 seconds."""
+        now = time.monotonic()
+        if self._owner_capacity is None or now - self._owner_capacity[0] > 10:
+            try:
+                answer = await self.remote_store.client.capacity()
+            except OffloadError as exc:
+                logger.info(f"[DRM] Owner capacity unavailable, decrypting here: {exc}")
+                answer = None
+            self._owner_capacity = (now, answer)
+        return self._owner_capacity[1]
+
+    async def _owner_decrypts(self, stream_bytes: int, *, can_decrypt_here: bool = True) -> bool:
+        answer = await self._owner_capacity_now()
+        if not answer or not answer.get("decrypts"):
+            return False
+        if not can_decrypt_here:
+            # No mp4decrypt here (or no DRM module): the owner is the only choice.
+            return True
+        owner = placement.Capacity(
+            rate=answer.get("rate"), waiting=int(answer.get("waiting") or 0), slots=int(answer.get("slots") or 1)
+        )
+        return placement.prefer_owner(stream_bytes, placement.meter.capacity(), owner)
+
+    async def _decrypt_on_owner(
+        self, item: DownloadItem, enc_streams: list[Path], drm_key: str, dest_path: Path
+    ) -> bool:
+        """Hand the encrypted streams over; the owner decrypts, merges and keeps the file."""
+        remote = self.remote_store
+        names = ("video", "audio")
+        streams = {name: stream for name, stream in zip(names, enc_streams)}
+        relative = dest_path.relative_to(remote.local_root).as_posix()
+        key = hashlib.sha256(f"{remote.owner_root}/{relative}".encode()).hexdigest()[:32]
+        created_at = getattr(item.media_metadata, "created_at", None)
+        mtime = created_at.timestamp() if isinstance(created_at, datetime) else None
+        await self._notify("decrypting", item)
+        logger.info(f"[DRM] Handing media {item.media_id} to {remote.client.owner.backend_id} to decrypt")
+        try:
+            kept = await remote.client.decrypt(
+                streams, key=key, root=remote.owner_root, path=relative, drm_key=drm_key, mtime=mtime
+            )
+        except OffloadError as exc:
+            logger.error(f"[DRM] Owner could not decrypt media {item.media_id}: {exc}")
+            return False
+        for stream in enc_streams:
+            await asyncio.to_thread(stream.unlink, missing_ok=True)
+        item.offloaded_path = str(kept["path"])
+        item.size = int(kept["size"])
+        item.downloaded_this_run = True
+        return True
+
+    async def _decrypt_here(
+        self,
+        item: DownloadItem,
+        enc_streams: list[Path],
+        drm_key: str,
+        dest_path: Path,
+        only_drm: OnlyDRM,
+    ) -> bool:
         drm_temp_directory = item.drm_media_settings.work_directory
         if drm_temp_directory is not None:
             drm_temp_directory.mkdir(parents=True, exist_ok=True)
@@ -1341,6 +1442,34 @@ class _DRMPipeline:
         return True
 
 
+async def _hand_over(remote_store: Any, download_results: list[DownloadResultItem]) -> None:
+    """Give finished files to the backend that keeps them, a few at a time.
+
+    The recorded path becomes the owner's; a file that cannot be handed over
+    stays here and its item fails as recoverable, so a retry sends it again.
+    """
+    from contextlib import aclosing
+
+    from ultima_scraper_core.concurrency import map_unordered
+
+    async def hand_over(result: DownloadResultItem) -> None:
+        kept = result.status == "downloaded" or (
+            result.status == "skipped" and result.has_error(DownloadFailureReason.ALREADY_EXISTS)
+        )
+        if not kept or result.path is None or not remote_store.holds(result.path):
+            return
+        try:
+            result.path = await remote_store.keep(result.path)
+        except (OffloadError, OSError) as exc:
+            logger.warning(f"[download_handler] Could not hand media {result.media_id} over: {exc}")
+            result.status = "failed"
+            result.add_error(DownloadFailureReason.DOWNLOAD_ERROR, f"hand-over to the storing backend failed: {exc}")
+
+    async with aclosing(map_unordered(hand_over, download_results, limit=2)) as runs:
+        async for _ in runs:
+            pass
+
+
 def _count_drm_items(items: list[DownloadItem]) -> int:
     return sum(1 for item in items if item.media_metadata and item.media_metadata.drm)
 
@@ -1368,12 +1497,14 @@ async def _run_download_pipeline(
     download_manager: DownloadManager,
     valid_items: list[DownloadItem],
     on_drm_progress: DRMProgressCallback | None = None,
+    remote_store: Any = None,
 ) -> dict[str, Any]:
     """Download items and post-process each DRM item as soon as it lands."""
     pipeline = _DRMPipeline(
         _count_drm_items(valid_items),
         on_drm_progress,
         release=download_manager.release_workspace,
+        remote_store=remote_store,
     )
     download_manager.on_downloaded.append(pipeline.submit)
     try:

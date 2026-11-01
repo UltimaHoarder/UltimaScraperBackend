@@ -109,6 +109,8 @@ class DownloadItem:
     start_time: float | None = None
     downloaded_this_run: bool = False
     failure_message: str | None = None
+    # Where the backend that keeps this file put it, when that is not here.
+    offloaded_path: str | None = None
 
     def get_filepath(self) -> Path:
         """Get the full target filepath."""
@@ -646,6 +648,12 @@ class DownloadManager:
                 for directory in matching_directories
                 if StagingPolicy.DRM_ONLY not in directory.policy
             ]
+        # Settings are shared across backends: skip staging this host cannot reach.
+        from .drive_selection import directory_writable_here
+
+        matching_directories = [
+            directory for directory in matching_directories if directory_writable_here(Path(directory.path))
+        ]
         if not matching_directories:
             required_names = ", ".join(
                 operation.value for operation in required_operations

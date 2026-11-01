@@ -39,6 +39,8 @@ class CreateJobRequest(BaseModel):
     save_as_template: bool | None = None
     template_name: str | None = None
     template_description: str | None = None
+    # Run only on this backend's workers (otherwise any backend may claim its tasks).
+    backend_id: str | None = None
 
 
 class CreateJobTemplateRequest(BaseModel):

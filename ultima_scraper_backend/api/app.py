@@ -38,7 +38,7 @@ configure_runtime_logging("api")
 
 from ..models.backend import BackendInstance
 from ..runtime_mode import get_runtime_mode, is_api_only_runtime
-from .. import cluster_clients
+from .. import cluster_clients, peer_tokens
 from ..security import (
     SECURITY_METRICS,
     admin_token_required,
@@ -80,6 +80,7 @@ from .routes import (
     jobs,
     media,
     mps,
+    offload,
     orders,
     proxies,
     search_loadouts,
@@ -491,6 +492,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     _statistics_refresh_task = asyncio.create_task(_statistics_refresh_loop(backend))
     cluster_client_task = asyncio.create_task(cluster_clients.refresh_loop())
+    # Decrypts run here for other backends too: size them to this host.
+    from ..job_system.host_capacity import apply_media_process_slots
+
+    apply_media_process_slots()
+    # This backend's token for handing downloads to the backend that keeps them.
+    try:
+        await asyncio.to_thread(peer_tokens.ensure_own_token, backend.instance_id)
+    except Exception:
+        logger.exception("Could not issue this backend's peer token; offloading to it is off")
+    peer_token_task = asyncio.create_task(peer_tokens.refresh_loop())
     logger.info("Daily statistics refresh monitor started")
 
     logger.info("Backend initialization complete")
@@ -523,6 +534,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
         cluster_client_task.cancel()
+        peer_token_task.cancel()
 
         if _statistics_refresh_task:
             _statistics_refresh_task.cancel()
@@ -620,6 +632,9 @@ async def security_http_middleware(
             if platform is None:
                 raise HTTPException(status_code=503, detail="Plugin platform not initialized")
             _get_runtime_identity(request, platform)
+        elif request.url.path.startswith(offload.OFFLOAD_PREFIX):
+            # Backend peer tokens only, checked by the routes themselves.
+            pass
         elif _is_protected_path(request.url.path) and not _uses_plugin_callback_auth(
             request.url.path
         ):
@@ -674,6 +689,7 @@ app.include_router(statistics.router, prefix="/api/v1")
 app.include_router(subscriptions.router, prefix="/api/v1")
 app.include_router(curl_parser.router, prefix="/api/v1")
 app.include_router(mps.router, prefix="/api/v1")
+app.include_router(offload.router, prefix="/api/v1")
 app.include_router(database_browser.router, prefix="/api/v1")
 app.include_router(files.router, prefix="/api/v1")
 app.include_router(server_restore.router, prefix="/api/v1")

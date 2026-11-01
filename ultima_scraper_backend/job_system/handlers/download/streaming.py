@@ -15,7 +15,7 @@ from ....database.media_selection import (
 )
 from ....database.write_queue import DatabaseWriteOperation, stable_command_id
 from ...download_manager import DownloadManager, ResourceManager
-from ...drive_selection import select_user_destination
+from ...drive_selection import DriveSelectionError, select_user_destination
 from ...models import TaskResult
 from .utils import normalise_files
 
@@ -196,7 +196,34 @@ async def _paid_download_targets(
         after = page[-1]
 
 
-async def download_selected_media(
+async def download_selected_media(*, context, config, **kwargs):
+    """Download into this backend's drives, or for another backend to keep."""
+    from ....offload.remote import open_offload
+
+    async with open_offload(config, getattr(context, "redis", None)) as offload:
+        return await _download_selected_media(context=context, config=config, offload=offload, **kwargs)
+
+
+async def _destination(offload, **request):
+    """This backend's drive for a performer, or the owner's when it has none."""
+    if offload is None:
+        return await asyncio.to_thread(select_user_destination, **request), None
+    from ....offload.client import OffloadError
+
+    try:
+        remote = await offload.destination(
+            site_name=request["site_name"],
+            user_id=request["user_id"],
+            usernames=list(request["usernames"]),
+            required_space=request["required_space"],
+            ignore_space_requirements=request["ignore_space_requirements"],
+        )
+    except OffloadError as exc:
+        raise DriveSelectionError(str(exc)) from exc
+    return remote.selection, remote
+
+
+async def _download_selected_media(
     *,
     task,
     context,
@@ -207,6 +234,7 @@ async def download_selected_media(
     config,
     content_type,
     resolved_auth_id,
+    offload,
 ):
     from .handler import _download_content_batch, _resolve_proxy_url
 
@@ -243,6 +271,7 @@ async def download_selected_media(
     spec["input_selection_id"] = input_selection_id
     store = MediaSelectionStore(db_manager.get_session)
     selection = None
+    remote = None
     if paid_feed:
         totals = await asyncio.to_thread(store.feed_download_totals, input_selection_id)
     else:
@@ -253,8 +282,8 @@ async def download_selected_media(
             content_type=content_type,
             auth_id=selection_auth_id,
         )
-        selection = await asyncio.to_thread(
-            select_user_destination,
+        selection, remote = await _destination(
+            offload,
             user_id=user_id,
             usernames=user.get_usernames(),
             site_name=task.site_name,
@@ -379,8 +408,8 @@ async def download_selected_media(
                     content_type=content_type,
                     auth_id=selection_auth_id,
                 )
-                selection = await asyncio.to_thread(
-                    select_user_destination,
+                selection, remote = await _destination(
+                    offload,
                     user_id=user_id,
                     usernames=user.get_usernames(),
                     site_name=task.site_name,
@@ -418,6 +447,7 @@ async def download_selected_media(
                     content_metadatas=page,
                     content_type=content_type,
                     destination_selection=selection,
+                    remote_store=remote,
                     download_manager=manager,
                     aggregate=counters,
                     evidence_spec=spec,

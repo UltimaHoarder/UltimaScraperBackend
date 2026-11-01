@@ -373,17 +373,20 @@ class MediaMetadata:
         api_user: Any,
         directory_hint: Path | None = None,
         directory_format_override: Path | None = None,
+        download_setup: Any | None = None,
     ) -> _MediaRenderContext | None:
         if self.content_metadata is None:
             return None
 
         authed = getattr(api_user, "get_authed", lambda: None)()
         api = getattr(authed, "get_api", lambda: None)() if authed is not None else None
-        config = getattr(api, "config", None)
-        if config is None:
+        if download_setup is None:
+            # A worker's site API carries the slimmer API config, without the
+            # download settings: callers that have the backend's pass them in.
+            config = getattr(api, "config", None)
+            download_setup = getattr(getattr(config, "settings", None), "download_setup", None)
+        if download_setup is None:
             return None
-
-        download_setup = config.settings.download_setup
         active_directory_format = Path(
             directory_format_override or download_setup.directory_format
         )
@@ -479,6 +482,7 @@ class MediaMetadata:
         base_directory: Path | None = None,
         directory_format_override: Path | None = None,
         render_full_directory_format: bool = False,
+        download_setup: Any | None = None,
     ) -> DownloadItem:
         """
         Convert to DownloadItem for the download manager.
@@ -526,6 +530,7 @@ class MediaMetadata:
                 api_user=api_user,
                 directory_hint=base_directory,
                 directory_format_override=directory_format_override,
+                download_setup=download_setup,
             )
             if render_context is not None:
                 formatter = PathFormatter(

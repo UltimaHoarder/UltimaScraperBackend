@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import shutil
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -28,6 +29,7 @@ __all__ = [
     "DriveSelectionResult",
     "DriveSelector",
     "UserDirectorySelection",
+    "has_usable_download_root",
     "select_download_destination",
     "select_user_destination",
     "select_user_directory",
@@ -282,7 +284,36 @@ def _flatten_drive_directories(setup: DownloadPathSetup) -> list[_DriveDirectory
     return drive_directories
 
 
+# Set while only checking whether any drive works, which repeats every few
+# seconds per worker: a drive missing on this host is expected, not news.
+_QUIET_DRIVE_PROBE: ContextVar[bool] = ContextVar("quiet_drive_probe", default=False)
+
+
+def has_usable_download_root(setup: DownloadPathSetup) -> bool:
+    """Whether this host can write to at least one configured download drive."""
+    token = _QUIET_DRIVE_PROBE.set(True)
+    try:
+        return any(
+            drive_dir.drive.store
+            and _prepare_drive_root_for_storage(drive_dir.path) is not None
+            for drive_dir in _flatten_drive_directories(setup)
+        )
+    finally:
+        _QUIET_DRIVE_PROBE.reset(token)
+
+
+def directory_writable_here(path: Path) -> bool:
+    """Whether this host can write under ``path``: an unmounted /mnt/<name> is not."""
+    token = _QUIET_DRIVE_PROBE.set(True)
+    try:
+        return _prepare_drive_root_for_storage(path) is not None
+    finally:
+        _QUIET_DRIVE_PROBE.reset(token)
+
+
 def _log_unavailable_drive_root(root: Path, reason: object) -> None:
+    if _QUIET_DRIVE_PROBE.get():
+        return
     logger.warning("Skipping unavailable download root %s: %s", root, reason)
 
 
@@ -515,6 +546,9 @@ def _find_existing_user_directory(
     user_id: int | None,
     site_aliases: Iterable[str] | None = None,
 ) -> UserDirectorySelection | None:
+    # The same folders come up for every alias, format and letter case:
+    # list each once per lookup, which matters on slow network drives.
+    listings: dict[Path, list[str]] = {}
     searchable_roots = [
         _prepare_drive_root_for_scan(drive_dir.path)
         for drive_dir in drive_directories
@@ -570,7 +604,7 @@ def _find_existing_user_directory(
                     )
                     for root in searchable_roots:
                         performer_relative = _find_matching_relative_path(
-                            root, template_parts, tokens
+                            root, template_parts, tokens, listings
                         )
                         if performer_relative is None or performer_relative in seen:
                             continue
@@ -629,10 +663,33 @@ def _build_performer_lookup_tokens(
     return tokens
 
 
+def _child_directories(parent: Path, listings: dict[Path, list[str]] | None) -> list[str]:
+    """Subfolder names, sorted; scandir reads each entry's type from the listing
+    itself instead of a stat per entry, so a big network folder lists in one call."""
+    if listings is not None and parent in listings:
+        return listings[parent]
+    children: list[str] = []
+    try:
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        children.append(entry.name)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    children.sort()
+    if listings is not None:
+        listings[parent] = children
+    return children
+
+
 def _find_matching_relative_path(
     root: Path,
     template_parts: list[str],
     tokens: Mapping[str, str],
+    listings: dict[Path, list[str]] | None = None,
 ) -> Path | None:
     current_matches = [Path()]
     for template_part in template_parts:
@@ -640,17 +697,7 @@ def _find_matching_relative_path(
         matcher = _compile_segment_matcher(template_part, tokens)
         for current in current_matches:
             parent = root / current
-            try:
-                children: list[str] = []
-                for entry in parent.iterdir():
-                    try:
-                        if entry.is_dir():
-                            children.append(entry.name)
-                    except OSError:
-                        continue
-            except OSError:
-                continue
-            for child_name in sorted(children):
+            for child_name in _child_directories(parent, listings):
                 if matcher.fullmatch(child_name):
                     next_matches.append(
                         current / child_name if current != Path() else Path(child_name)

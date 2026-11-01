@@ -64,6 +64,7 @@ from ..database.mps_manifest import (
     trusted_mps_identity_enabled,
 )
 from . import run_turnstile
+from .host_capacity import DOWNLOAD_CAPABILITY
 from .api_command_policy import WORKER_LEASE_ERROR_CODE, WORKER_LEASE_EXHAUSTED
 from .models import Job, Task, TaskResult, TaskState
 from .profile_completion import PROFILE_COMPLETION_KEY, read_committed_profile_completion
@@ -111,6 +112,14 @@ def _work_lane(task) -> str:
     return "download" if kind == "download" else "scrape"
 
 
+def _work_capabilities(task) -> list[str]:
+    """A download also needs a host that can store it right now."""
+    capabilities = list(task.capabilities)
+    if _work_lane(task) == "download" and DOWNLOAD_CAPABILITY not in capabilities:
+        capabilities.append(DOWNLOAD_CAPABILITY)
+    return capabilities
+
+
 def _insert_admitted_work(session, run_id, rows, candidates):
     """Insert admitted tasks and their payloads with two set-based statements.
 
@@ -128,7 +137,7 @@ def _insert_admitted_work(session, run_id, rows, candidates):
         "states": ["failed" if task.state == TaskState.FAILED else "queued" for task, _, _ in rows],
         "lanes": [_work_lane(task) for task, _, _ in rows],
         "sites": [task.site_name.lower() for task, _, _ in rows],
-        "capabilities": [json.dumps(list(task.capabilities)) for task, _, _ in rows],
+        "capabilities": [json.dumps(_work_capabilities(task)) for task, _, _ in rows],
         "dedup_keys": [task.dedup_key for task, _, _ in rows],
         "payload_bytes": [size for _, _, size in rows],
         "payload_sizes": [len(encoded.encode("utf-8")) for _, encoded, _ in rows],
