@@ -224,6 +224,21 @@ class StagingDirectory(BaseModel):
         return list(dict.fromkeys(value))
 
 
+def local_device_file(path: Path | None) -> Path | None:
+    """The configured Widevine device file, or the same name in this backend's
+    own config folder (``ultima_scraper_verse/drm_device``).
+
+    Settings are shared by every backend on a database, so a path written on
+    one host is missing on another that keeps its copy in its own config folder.
+    """
+    if path is None or path.expanduser().exists():
+        return path
+    from platformdirs import user_config_dir
+
+    local = Path(user_config_dir("ultima_scraper_verse")) / "drm_device" / path.name
+    return local if local.exists() else path
+
+
 class DRM(BaseModel):
     model_config = {"extra": "ignore"}
 
@@ -232,8 +247,8 @@ class DRM(BaseModel):
 
     def to_usapi_drm(self) -> USAPIDRM:
         return USAPIDRM(
-            device_client_blob_filepath=self.device_client_blob_filepath,
-            device_private_key_filepath=self.device_private_key_filepath,
+            device_client_blob_filepath=local_device_file(self.device_client_blob_filepath),
+            device_private_key_filepath=local_device_file(self.device_private_key_filepath),
         )
 
 
