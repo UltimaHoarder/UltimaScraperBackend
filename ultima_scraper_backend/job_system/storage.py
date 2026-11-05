@@ -2482,7 +2482,8 @@ return count
         batch_size: int | None = None,
         max_bytes: int | None = None,
     ) -> tuple[int, int]:
-        if batch_size is None:
+        # The deprecated variable, while set, still wins over the setting.
+        if batch_size is None and not (runtime_env_value("ULTIMA_JOB_TASK_ARCHIVE_BATCH_SIZE") or "").strip():
             try:
                 from .resources import _persisted_job_execution_setting
 
