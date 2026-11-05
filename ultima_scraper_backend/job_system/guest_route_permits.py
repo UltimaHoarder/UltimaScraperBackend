@@ -106,7 +106,9 @@ class GuestRoutePermits:
         self.capacities = {route: max(1, int(limit)) for route, limit in capacities.items()}
         self.lease_ms = int(lease_seconds * 1000)
         self._acquire = client.register_script(_ACQUIRE)
-        self._fail_open_logged = 0.0
+        # -inf, not 0: time.monotonic() counts from boot, so 0 would hide the first
+        # failure on a machine up for less than _FAIL_OPEN_LOG_SECONDS.
+        self._fail_open_logged = float("-inf")
         self.coalesce_seconds = (
             release_coalesce_seconds() if coalesce_seconds is None else coalesce_seconds
         )

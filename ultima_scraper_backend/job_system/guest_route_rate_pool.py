@@ -75,7 +75,9 @@ class GuestRouteRatePool:
         self.rate = float(rate)
         self.burst_ms = max(0.0, burst_seconds) * 1000.0
         self._reserve = client.register_script(_RESERVE)
-        self._fail_open_logged = 0.0
+        # -inf, not 0: time.monotonic() counts from boot, so 0 would hide the first
+        # failure on a machine up for less than _FAIL_OPEN_LOG_SECONDS.
+        self._fail_open_logged = float("-inf")
 
     async def __call__(self, route_key: str, fraction: float) -> bool:
         """Wait for this request's slot; False means pace locally instead."""

@@ -1,6 +1,6 @@
 [project]
 name = "ultima-scraper-backend"
-version = "0.1.0"
+version = "0.1.1"
 description = "USR backend API, control plane, and worker service"
 readme = "README.md"
 license = "MIT"
