@@ -784,6 +784,32 @@ def _walk_secret_fields(data: Any, mutator: Any) -> None:
                     proxy = cast(dict[str, Any], proxy_obj)
                     proxy["password"] = mutator(proxy.get("password"))
 
+    # A webhook URL carries the token that lets anyone post to it.
+    routing_obj = settings.get("webhook_routing")
+    if isinstance(routing_obj, dict):
+        for site_routing in cast(dict[str, Any], routing_obj).values():
+            if not isinstance(site_routing, dict):
+                continue
+            destinations = cast(dict[str, Any], site_routing).get("destinations")
+            if isinstance(destinations, list):
+                for destination_obj in cast(list[Any], destinations):
+                    if isinstance(destination_obj, dict) and "url" in destination_obj:
+                        destination = cast(dict[str, Any], destination_obj)
+                        destination["url"] = mutator(destination.get("url"))
+
+    # Webhook URLs from before per-site routing.
+    site_apis_obj = data_dict.get("site_apis")
+    if isinstance(site_apis_obj, dict):
+        for site_obj in cast(dict[str, Any], site_apis_obj).values():
+            if not isinstance(site_obj, dict):
+                continue
+            webhooks = cast(dict[str, Any], site_obj).get("webhooks")
+            if isinstance(webhooks, dict):
+                for hook_obj in cast(dict[str, Any], webhooks).values():
+                    if isinstance(hook_obj, dict) and "url" in hook_obj:
+                        hook = cast(dict[str, Any], hook_obj)
+                        hook["url"] = mutator(hook.get("url"))
+
 
 def _encrypt_config_secrets(data: dict[str, Any]) -> None:
     _walk_secret_fields(data, encrypt_secret_value)

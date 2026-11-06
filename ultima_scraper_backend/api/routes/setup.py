@@ -220,6 +220,28 @@ _REQUIRED_POSTGRES_EXTENSIONS = ("uuid-ossp", "pg_trgm")
 _OPTIONAL_POSTGRES_EXTENSIONS = ("vector",)
 
 
+async def _verify_cluster_secret_key(engine: Any) -> str | None:
+    """None when this backend's USR_SECRET_KEY is the cluster's, else why not.
+
+    Every backend sharing a database needs the same key; the first one to check
+    records it. See ultima_scraper_db_archive.secret_key_check.
+    """
+    from ultima_scraper_db_archive.secret_key_check import (
+        SecretKeyMismatch,
+        verify_secret_key,
+    )
+
+    try:
+        async with engine.connect() as connection:
+            await connection.run_sync(verify_secret_key)
+    except SecretKeyMismatch as exc:
+        return str(exc)
+    except Exception:
+        # Startup checks again; an unreachable database is reported elsewhere.
+        logger.warning("Could not check USR_SECRET_KEY against the cluster", exc_info=True)
+    return None
+
+
 async def _ensure_postgres_extensions(engine: Any) -> None:
     """Install shared extensions in ``public`` and repair older placements."""
     from sqlalchemy import text
@@ -1065,6 +1087,20 @@ async def apply_startup_migration(
             status="completed", outcome="applied", revision=revision,
             message="Migration applied successfully.", output=output,
         ))
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        check_engine = create_async_engine(db_url)
+        try:
+            key_problem = await _verify_cluster_secret_key(check_engine)
+        finally:
+            await check_engine.dispose()
+        if key_problem:
+            output.append(key_problem)
+            return StartupMigrationActionResponse(
+                success=False,
+                message=f"Migration applied, but {key_problem}",
+                output=output,
+            )
         return StartupMigrationActionResponse(
             success=True,
             message="Migration applied successfully.",
@@ -1335,9 +1371,12 @@ async def test_database_connection(
                     asyncio.to_thread(command.upgrade, alembic_cfg, "head"),
                     timeout=DB_MIGRATION_TIMEOUT,
                 )
+                key_problem = await _verify_cluster_secret_key(engine)
             finally:
                 await engine.dispose()
 
+            if key_problem:
+                return DatabaseConnectionResponse(success=False, message=key_problem)
             return DatabaseConnectionResponse(
                 success=True,
                 message=f"Connected to {short_version} and verified schema",
@@ -1421,9 +1460,12 @@ async def test_database_connection(
                         asyncio.to_thread(command.upgrade, alembic_cfg, "head"),
                         timeout=DB_MIGRATION_TIMEOUT,
                     )
+                    key_problem = await _verify_cluster_secret_key(engine)
                 finally:
                     await engine.dispose()
 
+                if key_problem:
+                    return DatabaseConnectionResponse(success=False, message=key_problem)
                 return DatabaseConnectionResponse(
                     success=True,
                     message=f"Created database '{db_name}' and initialized schema on {short_version}",
