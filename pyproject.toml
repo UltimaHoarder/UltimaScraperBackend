@@ -1,6 +1,6 @@
 [project]
 name = "ultima-scraper-backend"
-version = "0.1.1"
+version = "0.2.0"
 description = "USR backend API, control plane, and worker service"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -20,7 +20,7 @@ dependencies = [
     "ultima-scraper-api>=3.0.0b5,<4",
     "ultima-scraper-core>=0.1,<1",
     "ultima-scraper-db>=0.5,<1",
-    "ultima-scraper-db-archive>=0.2,<1",
+    "ultima-scraper-db-archive>=0.3,<1",
     "sqlmodel>=0.0.24",
     "apscheduler>=3.11,<4",
     "packaging>=24,<27",
@@ -48,7 +48,7 @@ build-backend = "hatchling.build"
 packages = ["ultima_scraper_backend"]
 
 [tool.uv.sources]
-ultima-scraper-core = { git = "https://github.com/UltimaHoarder/UltimaScraper.git", subdirectory = "src/UltimaScraperCore", branch = "main" }
+ultima-scraper-core = { git = "https://github.com/UltimaHoarder/UltimaScraperCore.git", branch = "main" }
 ultima-scraper-api = { git = "https://github.com/UltimaHoarder/UltimaScraperAPI.git", branch = "main" }
 ultima-scraper-db = { git = "https://github.com/DATAHOARDERS/UltimaScraperDB.git", branch = "main" }
 ultima-scraper-db-archive = { git = "https://github.com/UltimaHoarder/UltimaScraperDBArchive.git", branch = "main" }

@@ -1400,8 +1400,8 @@ wheels = [
 
 [[package]]
 name = "ultima-scraper-api"
-version = "3.0.0b4"
-source = { editable = "../../UltimaScraperAPI" }
+version = "3.0.0b5"
+source = { git = "https://github.com/UltimaHoarder/UltimaScraperAPI.git?branch=main#1aac21581a5d6ce2c57c1d452639ec008e1baeb3" }
 dependencies = [
     { name = "aiofiles" },
     { name = "aiohttp" },
@@ -1427,49 +1427,9 @@ dependencies = [
     { name = "xmltodict" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "aiofiles", specifier = ">=22.1.0" },
-    { name = "aiohttp", specifier = ">=3.8.4" },
-    { name = "aiohttp-socks", specifier = ">=0.9.0" },
-    { name = "alive-progress", specifier = ">=3.1.5" },
-    { name = "beautifulsoup4", specifier = ">=4.11.1" },
-    { name = "black", marker = "extra == 'dev'", specifier = ">=23.3.0" },
-    { name = "dill", specifier = ">=0.3.6" },
-    { name = "ffmpeg-python", specifier = ">=0.2.0" },
-    { name = "httpx", specifier = ">=0.28" },
-    { name = "inflection", specifier = ">=0.5.1" },
-    { name = "lxml", specifier = ">=4.9.1" },
-    { name = "mergedeep", specifier = ">=1.3.4" },
-    { name = "mkdocs-material", marker = "extra == 'dev'", specifier = ">=9.6.22" },
-    { name = "nox", marker = "extra == 'dev'", specifier = ">=2024.0.0" },
-    { name = "orjson", specifier = ">=3.8.3" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
-    { name = "python-dateutil", specifier = ">=2.8.2" },
-    { name = "python-semantic-release", marker = "extra == 'dev'", specifier = ">=7.33.2" },
-    { name = "python-socks", extras = ["asyncio"], specifier = ">=2.2.0" },
-    { name = "pywidevine", git = "https://github.com/UltimaHoarder/pywidevine.git" },
-    { name = "redis", extras = ["hiredis"], specifier = ">=6.2.0,<7.0.0" },
-    { name = "requests", extras = ["socks"], specifier = ">=2.28" },
-    { name = "user-agent", specifier = ">=0.1.10" },
-    { name = "websockets", specifier = ">=15.0.1,<16.0.0" },
-    { name = "win32-setctime", marker = "sys_platform == 'win32'", specifier = ">=1.1.0" },
-    { name = "xmltodict", specifier = ">=0.13.0" },
-]
-provides-extras = ["dev"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mkdocs", specifier = ">=1.6.1" },
-    { name = "mkdocs-material", specifier = ">=9.6.22" },
-]
-
 [[package]]
 name = "ultima-scraper-backend"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -1517,10 +1477,10 @@ requires-dist = [
     { name = "redis", extras = ["hiredis"], specifier = ">=6.2.0,<7.0.0" },
     { name = "sqlmodel", specifier = ">=0.0.24" },
     { name = "ujson", specifier = ">=5,<6" },
-    { name = "ultima-scraper-api", editable = "../../UltimaScraperAPI" },
-    { name = "ultima-scraper-core", editable = "../../UltimaScraper/src/UltimaScraperCore" },
-    { name = "ultima-scraper-db", editable = "../../UltimaDatabases/UltimaScraperDB" },
-    { name = "ultima-scraper-db-archive", editable = "../../UltimaDatabases/UltimaScraperDBArchive" },
+    { name = "ultima-scraper-api", git = "https://github.com/UltimaHoarder/UltimaScraperAPI.git?branch=main" },
+    { name = "ultima-scraper-core", git = "https://github.com/UltimaHoarder/UltimaScraperCore.git?branch=main" },
+    { name = "ultima-scraper-db", git = "https://github.com/DATAHOARDERS/UltimaScraperDB.git?branch=main" },
+    { name = "ultima-scraper-db-archive", git = "https://github.com/UltimaHoarder/UltimaScraperDBArchive.git?branch=main" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.41,<0.42" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.21" },
     { name = "websockets", specifier = ">=15,<16" },
@@ -1529,46 +1489,25 @@ requires-dist = [
 [[package]]
 name = "ultima-scraper-core"
 version = "0.1.0"
-source = { editable = "../../UltimaScraper/src/UltimaScraperCore" }
+source = { git = "https://github.com/UltimaHoarder/UltimaScraperCore.git?branch=main#785d3c61a4e75c576095130039c8c55f7f60ad8a" }
 dependencies = [
     { name = "platformdirs" },
 ]
 
-[package.metadata]
-requires-dist = [{ name = "platformdirs", specifier = ">=4.3,<5" }]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8.0" }]
-
 [[package]]
 name = "ultima-scraper-db"
-version = "0.2.0"
-source = { editable = "../../UltimaDatabases/UltimaScraperDB" }
+version = "0.5.0"
+source = { git = "https://github.com/DATAHOARDERS/UltimaScraperDB.git?branch=main#2115cca48c59f1353f4af789e4b4f16a8c405273" }
 dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "alembic", specifier = ">=1.17,<2" },
-    { name = "asyncpg", specifier = ">=0.30,<1" },
-    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.44,<3" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.14,<2" },
-    { name = "pytest", specifier = ">=8.2,<9" },
-    { name = "pytest-asyncio", specifier = ">=0.23,<2" },
-    { name = "ruff", specifier = ">=0.12,<1" },
-]
-
 [[package]]
 name = "ultima-scraper-db-archive"
-version = "0.2.0"
-source = { editable = "../../UltimaDatabases/UltimaScraperDBArchive" }
+version = "0.3.0"
+source = { git = "https://github.com/UltimaHoarder/UltimaScraperDBArchive.git?branch=main#7acb67452954aec7b9ee4df7872a32b3645ca5a1" }
 dependencies = [
     { name = "alembic" },
     { name = "cryptography" },
@@ -1577,24 +1516,6 @@ dependencies = [
     { name = "ultima-scraper-api" },
     { name = "ultima-scraper-core" },
     { name = "ultima-scraper-db" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "alembic", specifier = ">=1.14,<2" },
-    { name = "cryptography", specifier = ">=50,<51" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.3,<4" },
-    { name = "sqlmodel", specifier = ">=0.0.24,<1" },
-    { name = "ultima-scraper-api", editable = "../../UltimaScraperAPI" },
-    { name = "ultima-scraper-core", editable = "../../UltimaScraper/src/UltimaScraperCore" },
-    { name = "ultima-scraper-db", editable = "../../UltimaDatabases/UltimaScraperDB" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.2,<9" },
-    { name = "pytest-asyncio", specifier = ">=0.23,<2" },
-    { name = "ruff", specifier = ">=0.12,<1" },
 ]
 
 [[package]]
