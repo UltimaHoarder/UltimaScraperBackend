@@ -455,6 +455,14 @@ class JobTemplate:
     def _instantiate_tasks(self, tokens: Mapping[str, Any]) -> List[Task]:
         instantiated: List[Task] = []
         alias_map: dict[str, str] = {}
+        # A scrape with its own download task here must not get another from
+        # download_media when the job is expanded (the built-in template sets both).
+        downloaded_scrapes = {
+            dependency
+            for definition in self.tasks
+            if definition.task_type == TaskType.DOWNLOAD
+            for dependency in definition.depends_on
+        }
 
         for definition in self.tasks:
             site_name = str(self._render(definition.site_name_template, tokens) or "")
@@ -475,6 +483,12 @@ class JobTemplate:
             payload = _strip_template_payload_metadata(
                 self._render_value(definition.payload_template, tokens)
             )
+            if (
+                definition.task_type == TaskType.SCRAPE
+                and definition.name in downloaded_scrapes
+                and isinstance(payload, dict)
+            ):
+                payload["download_media"] = False
             rendered_auth_id = (
                 self._render(definition.auth_id_template, tokens)
                 if definition.auth_id_template
