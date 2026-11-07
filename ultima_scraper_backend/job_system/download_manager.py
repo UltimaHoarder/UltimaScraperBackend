@@ -40,6 +40,9 @@ from ultima_scraper_backend.config import (
 
 logger = logging.getLogger(__name__)
 
+# Tries at a file's HEAD request before a dropped connection fails the file.
+HEAD_ATTEMPTS = 4
+
 if TYPE_CHECKING:
     from ..database.write_queue import DatabaseWriteClient
     from .metadata_models import MediaMetadata
@@ -845,24 +848,36 @@ class DownloadManager:
         if not self.session:
             raise ValueError("Session not initialized")
 
-        async with self.head_semaphore:
-            try:
-                async with self.session.head(
-                    item.url,
-                    headers=item.headers,
-                    allow_redirects=True,
-                    proxy=self._request_proxy_url,
-                ) as response:
-                    if response.status == 200:
-                        return response
-                    else:
-                        logger.warning(
-                            f"HEAD request failed: {response.status} for {item.url}"
-                        )
+        for attempt in range(1, HEAD_ATTEMPTS + 1):
+            async with self.head_semaphore:
+                try:
+                    async with self.session.head(
+                        item.url,
+                        headers=item.headers,
+                        allow_redirects=True,
+                        proxy=self._request_proxy_url,
+                    ) as response:
+                        if response.status == 200:
+                            return response
+                        else:
+                            logger.warning(
+                                f"HEAD request failed: {response.status} for {item.url}"
+                            )
+                            return None
+                except (aiohttp.ClientConnectionError, OSError) as exc:
+                    # A proxy drops a connection now and then; the next one
+                    # usually gets through, so one drop doesn't fail the file.
+                    if attempt == HEAD_ATTEMPTS:
+                        logger.error(f"HEAD request error for {item.url}: {exc}")
                         return None
-            except Exception as exc:
-                logger.error(f"HEAD request error for {item.url}: {exc}")
-                return None
+                    logger.warning(
+                        f"HEAD request error (attempt {attempt}/{HEAD_ATTEMPTS}), retrying: {exc}"
+                    )
+                except Exception as exc:
+                    logger.error(f"HEAD request error for {item.url}: {exc}")
+                    return None
+            await asyncio.sleep(attempt)
+        return None
 
     async def download_part(
         self,
