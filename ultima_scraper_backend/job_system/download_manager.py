@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlparse
 
-import aiofiles
 import aiohttp
 from aiohttp_socks import ProxyConnector
 from ultima_scraper_api import user_types
@@ -335,6 +334,58 @@ def _merge_parts_sync(
             logger.warning(
                 "Merged %s but could not clean up %s: %s", dest_path, parts_folder, exc
             )
+
+
+def _download_target(workspace_target: Path) -> Path:
+    """The file an item's parts write into, each at its own offset."""
+    return workspace_target.with_name(workspace_target.name + ".download")
+
+
+def _range_ledger(target: Path) -> Path:
+    """Lists the file's size, then each finished range, so a restart resumes."""
+    return target.with_name(target.name + ".ranges")
+
+
+def _prepare_download_target(target: Path, file_size: int) -> None:
+    """Keep finished ranges of the same file; start again for anything else."""
+    ledger = _range_ledger(target)
+    header = f"size:{file_size}"
+    try:
+        lines = ledger.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    if target.exists() and lines[:1] == [header]:
+        return
+    target.unlink(missing_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(header + "\n", encoding="utf-8")
+
+
+def _range_recorded(target: Path, record: str) -> bool:
+    try:
+        lines = _range_ledger(target).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return False
+    return record in lines[1:] and target.exists()
+
+
+def _record_range(target: Path, record: str) -> None:
+    with _range_ledger(target).open("a", encoding="utf-8") as ledger:
+        ledger.write(record + "\n")
+
+
+def _write_at(fd: int, data: bytearray, offset: int, limit: int) -> int:
+    """Write up to `limit` bytes of `data` at `offset`; returns how many."""
+    view = memoryview(data)[: max(limit, 0)]
+    done = 0
+    while done < len(view):
+        done += os.pwrite(fd, view[done:], offset + done)
+    return done
+
+
+def _publish_download(target: Path, workspace_target: Path) -> None:
+    os.replace(target, workspace_target)
+    _range_ledger(target).unlink(missing_ok=True)
 
 
 def _resolve_disk_usage_path(path: Path) -> Path:
@@ -821,7 +872,8 @@ class DownloadManager:
             part_num: Part number for naming
 
         Returns:
-            Path to downloaded part file, or error code (1=retry, 2=abort)
+            Path to the file the part was written into (shared by all the
+            item's parts), or error code (1=retry, 2=abort)
         """
         if not self.session:
             raise ValueError("Session not initialized")
@@ -829,41 +881,32 @@ class DownloadManager:
         domain_sem = self.get_domain_semaphore(item.url)
 
         async with self.semaphore, domain_sem:
-            filepath = item.get_workspace_filepath()
-            parts_folder = filepath.parent / "__parts__"
-            parts_folder.mkdir(parents=True, exist_ok=True)
-
-            part_path = (
-                parts_folder / f"{filepath.stem}_part{part_num}{filepath.suffix}"
-            )
-            temp_path = part_path.with_suffix(part_path.suffix + ".part")
+            # Every part writes its range in place, in one file shared by the
+            # parts, so nothing has to be joined afterwards.
+            target = _download_target(item.get_workspace_filepath())
+            expected_size = end_byte - start_byte + 1
+            record = f"{start_byte}-{end_byte}"
 
             max_attempts = 10
             attempts = 0
+            # Kept across attempts, so a retry continues where the last stopped.
+            written = 0
+
+            def room() -> int:
+                # A known size bounds the range; without one, take what comes.
+                return expected_size - written if item.size else len(buffer)
 
             while attempts < max_attempts:
                 attempts += 1
 
-                # Check if we already have partial data
-                existing_size = temp_path.stat().st_size if temp_path.exists() else 0
-                expected_size = end_byte - start_byte + 1
-                self._record_part_processed(
-                    item,
-                    part_num,
-                    existing_size,
-                    expected_size,
-                )
+                if await asyncio.to_thread(_range_recorded, target, record):
+                    self._record_part_processed(
+                        item, part_num, expected_size, expected_size
+                    )
+                    return target
+                self._record_part_processed(item, part_num, written, expected_size)
 
-                if existing_size >= expected_size:
-                    # Already complete
-                    if temp_path.exists():
-                        await asyncio.to_thread(
-                            os.rename, str(temp_path), str(part_path)
-                        )
-                    return part_path
-
-                # Calculate actual byte range to download
-                actual_start = start_byte + existing_size
+                actual_start = start_byte + written
                 headers = {
                     **item.headers,
                     "Range": f"bytes={actual_start}-{end_byte}",
@@ -882,10 +925,18 @@ class DownloadManager:
                             )
                             await asyncio.sleep(1)
                             continue
+                        if response.status == 200 and actual_start > 0:
+                            # The whole file, not this range: it can't go at this offset.
+                            logger.error(
+                                f"Download part {part_num}: the server ignored the range"
+                            )
+                            return 2
 
-                        # Download data in chunks
-                        total_downloaded = existing_size
-                        async with aiofiles.open(temp_path, "ab") as f:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        fd = await asyncio.to_thread(
+                            os.open, target, os.O_WRONLY | os.O_CREAT, 0o644
+                        )
+                        try:
                             buffer = bytearray()
                             chunk_size = 65536  # 64KB chunks
 
@@ -893,40 +944,50 @@ class DownloadManager:
                                 chunk_size
                             ):
                                 buffer.extend(chunk)
-                                total_downloaded += len(chunk)
                                 await self._record_download_chunk(item, len(chunk))
 
                                 # Write buffer when it reaches threshold
                                 if len(buffer) >= chunk_size * 16:  # Write every 1MB
-                                    await f.write(buffer)
+                                    written += await asyncio.to_thread(
+                                        _write_at,
+                                        fd,
+                                        buffer,
+                                        start_byte + written,
+                                        room(),
+                                    )
                                     buffer.clear()
                                     self._record_part_processed(
                                         item,
                                         part_num,
-                                        total_downloaded,
+                                        written,
                                         expected_size,
                                     )
 
                             # Write remaining buffer
                             if buffer:
-                                await f.write(buffer)
+                                written += await asyncio.to_thread(
+                                    _write_at,
+                                    fd,
+                                    buffer,
+                                    start_byte + written,
+                                    room(),
+                                )
                             self._record_part_processed(
                                 item,
                                 part_num,
-                                total_downloaded,
+                                written,
                                 expected_size,
                             )
+                        finally:
+                            await asyncio.to_thread(os.close, fd)
 
                         # Verify download completed
-                        final_size = temp_path.stat().st_size
-                        if final_size >= expected_size:
-                            await asyncio.to_thread(
-                                os.rename, str(temp_path), str(part_path)
-                            )
-                            return part_path
+                        if written >= expected_size:
+                            await asyncio.to_thread(_record_range, target, record)
+                            return target
                         else:
                             logger.warning(
-                                f"Part {part_num} incomplete: {final_size}/{expected_size}"
+                                f"Part {part_num} incomplete: {written}/{expected_size}"
                             )
                             continue
 
@@ -990,8 +1051,13 @@ class DownloadManager:
         num_parts: int,
         workspace_target: Path,
     ) -> Path | Literal[False]:
+        target = _download_target(workspace_target)
+        await asyncio.to_thread(_prepare_download_target, target, file_size)
         if num_parts == 1:
             part_result = await self.download_part(item, 0, max(file_size - 1, 0), 0)
+            if part_result == target:
+                await asyncio.to_thread(_publish_download, target, workspace_target)
+                return workspace_target
             if isinstance(part_result, Path):
                 await self._finalize_workspace_file(part_result, workspace_target)
                 return workspace_target
@@ -1020,6 +1086,10 @@ class DownloadManager:
                 logger.error(f"Part download failed with code: {result}")
                 return False
 
+        if all(path == target for path in part_paths):
+            # Written in place: publishing is a rename.
+            await asyncio.to_thread(_publish_download, target, workspace_target)
+            return workspace_target
         if not await self.merge_parts(workspace_target, part_paths):
             return False
         return workspace_target

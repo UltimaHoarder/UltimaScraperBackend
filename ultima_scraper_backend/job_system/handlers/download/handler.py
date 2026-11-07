@@ -17,7 +17,7 @@ import importlib
 import json
 import logging
 import os
-import shutil
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1390,13 +1390,41 @@ class _DRMPipeline:
         drm_temp_directory = item.drm_media_settings.work_directory
         if drm_temp_directory is not None:
             drm_temp_directory.mkdir(parents=True, exist_ok=True)
-        merge_target = (
-            drm_temp_directory / dest_path.name if drm_temp_directory else dest_path
-        )
-        temp_merge_target = _build_temp_merge_path(merge_target)
+        temp_merge_target = _merge_target(dest_path)
 
         await self._notify("decrypting", item)
         logger.info(f"[DRM] Decrypting streams for media {item.media_id}")
+        success = await _decrypt_and_merge(
+            only_drm, enc_streams, drm_key, temp_merge_target
+        )
+        if not success:
+            success = await self._decrypt_then_merge(
+                item, enc_streams, drm_key, temp_merge_target, only_drm
+            )
+
+        if not (success and temp_merge_target.exists()):
+            logger.error(f"[DRM] Merge failed for media {item.media_id}")
+            await asyncio.to_thread(temp_merge_target.unlink, missing_ok=True)
+            return False
+        await asyncio.to_thread(os.replace, temp_merge_target, dest_path)
+        final_size = dest_path.stat().st_size
+        item.downloaded_this_run = True
+        # Update item.size so _process_download_result doesn't flag a
+        # size mismatch (encrypted stream sizes != final muxed size).
+        item.size = final_size
+        logger.info(f"[DRM] Successfully created {dest_path} ({final_size:,} bytes)")
+        return True
+
+    async def _decrypt_then_merge(
+        self,
+        item: DownloadItem,
+        enc_streams: list[Path],
+        drm_key: str,
+        temp_merge_target: Path,
+        only_drm: OnlyDRM,
+    ) -> bool:
+        """Decrypt each stream with mp4decrypt, then merge the decrypted copies."""
+        drm_temp_directory = item.drm_media_settings.work_directory
         decrypted = await asyncio.gather(
             *(
                 only_drm.decrypt_file_async(
@@ -1421,25 +1449,7 @@ class _DRMPipeline:
             f"[DRM] Merging streams for media {item.media_id} to {temp_merge_target}"
         )
         await self._notify("merging", item)
-        success = await only_drm.merge_media(temp_merge_target, dec_streams)
-
-        if not (success and temp_merge_target.exists()):
-            logger.error(f"[DRM] Merge failed for media {item.media_id}")
-            return False
-        if merge_target != temp_merge_target:
-            await asyncio.to_thread(
-                shutil.move, str(temp_merge_target), str(merge_target)
-            )
-        if merge_target != dest_path:
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(shutil.move, str(merge_target), str(dest_path))
-        final_size = dest_path.stat().st_size
-        item.downloaded_this_run = True
-        # Update item.size so _process_download_result doesn't flag a
-        # size mismatch (encrypted stream sizes != final muxed size).
-        item.size = final_size
-        logger.info(f"[DRM] Successfully created {dest_path} ({final_size:,} bytes)")
-        return True
+        return await only_drm.merge_media(temp_merge_target, dec_streams)
 
 
 async def _hand_over(remote_store: Any, download_results: list[DownloadResultItem]) -> None:
@@ -1468,6 +1478,58 @@ async def _hand_over(remote_store: Any, download_results: list[DownloadResultIte
     async with aclosing(map_unordered(hand_over, download_results, limit=2)) as runs:
         async for _ in runs:
             pass
+
+
+def _merge_target(dest_path: Path) -> Path:
+    """Where the merge writes: beside the final file, so publishing is a rename.
+
+    Writing it in staging instead would mean copying the whole file again
+    whenever staging and the library are on different filesystems.
+    """
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    return _build_temp_merge_path(dest_path)
+
+
+_CONTENT_KEY = re.compile(r"[0-9a-fA-F]{32}")
+
+
+async def _decrypt_and_merge(
+    only_drm: OnlyDRM, streams: list[Path], drm_key: str, output: Path
+) -> bool:
+    """Decrypt and merge the CENC streams in one ffmpeg pass, straight to `output`.
+
+    It reads each encrypted stream once and writes nothing else, where
+    mp4decrypt writes a decrypted copy of each stream and the merge reads
+    those again. False when it can't, and the caller decrypts with mp4decrypt.
+    """
+    formatter = getattr(only_drm, "media_formatter", None)
+    # The key is KID:KEY; ffmpeg wants the key alone.
+    key = drm_key.rsplit(":", 1)[-1]
+    if formatter is None or not streams or not _CONTENT_KEY.fullmatch(key):
+        return False
+    args = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y"]
+    for stream in streams:
+        args += ["-decryption_key", key, "-i", stream.as_posix()]
+    for index in range(len(streams)):
+        args += ["-map", str(index)]
+    args += ["-c", "copy", "-f", "mp4", output.as_posix()]
+    try:
+        result = await formatter.run_process(args)
+    except (OSError, RuntimeError) as exc:
+        # ffmpeg is missing, or the formatter is shutting down.
+        logger.warning(f"[DRM] ffmpeg could not decrypt {output.name}: {exc}")
+        result = None
+    if result is None or result.returncode or not output.exists():
+        if result is not None:
+            logger.warning(
+                f"[DRM] ffmpeg could not decrypt {output.name}, using mp4decrypt: "
+                f"{result.stderr.decode(errors='replace')[-500:]}"
+            )
+        await asyncio.to_thread(output.unlink, missing_ok=True)
+        return False
+    for stream in streams:
+        await asyncio.to_thread(stream.unlink, missing_ok=True)
+    return True
 
 
 def _count_drm_items(items: list[DownloadItem]) -> int:
