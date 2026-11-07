@@ -609,6 +609,9 @@ async def _download_content_batch(
                 expected_bytes=task_expected_bytes(
                     int(event_dict.get("expected_bytes") or 0)
                 ),
+                # The file named by media_id; the fields above are the whole task's.
+                media_processed_bytes=dm_event.get("item_processed_bytes"),
+                media_expected_bytes=dm_event.get("item_expected_bytes"),
             )
             await publish_download_progress(event_dict)
 

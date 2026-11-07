@@ -614,6 +614,12 @@ class DownloadManager:
     def _expected_transfer_bytes(self) -> int:
         return self._expected_bytes
 
+    def _item_transfer_bytes(self, item: DownloadItem) -> tuple[int, int]:
+        """This file's processed and expected bytes, as opposed to the batch's."""
+        processed = sum(self._processed_parts_by_item.get(id(item), {}).values())
+        expected = self._expected_bytes_by_item.get(id(item), 0)
+        return processed, max(expected, processed)
+
     def _processed_transfer_bytes(self) -> int:
         return self._processed_bytes
 
@@ -646,6 +652,7 @@ class DownloadManager:
 
             self._last_progress_emit_at = now
             self._reported_transferred_bytes = self._transferred_bytes
+            item_processed, item_expected = self._item_transfer_bytes(item)
             await self._notify_progress(
                 {
                     "status": status,
@@ -653,6 +660,8 @@ class DownloadManager:
                     "bytes": max(bytes_delta, 0),
                     "processed_bytes": self._processed_transfer_bytes(),
                     "expected_bytes": self._expected_transfer_bytes(),
+                    "item_processed_bytes": item_processed,
+                    "item_expected_bytes": item_expected,
                     "duration": now - self._transfer_started_at,
                     "path": path,
                     "completed": self.completed,
