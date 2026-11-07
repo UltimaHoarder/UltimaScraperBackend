@@ -702,6 +702,20 @@ _POST_PURCHASE_CONTENT_TYPES: list[ContentType] = [
 ]
 
 
+async def _create_scrape_download_jobs(
+    site: str,
+    purchases: list[tuple[int, int, str | None]],
+    backend_manager: BackendManager,
+) -> None:
+    """Create each purchased performer's job in turn.
+
+    Each takes database connections; started all at once, an order's worth
+    exhausts the API's pool and most of them fail.
+    """
+    for auth_id, user_id, username in purchases:
+        await _create_scrape_download_job(site, auth_id, user_id, username, backend_manager)
+
+
 async def _create_scrape_download_job(
     site: str,
     auth_id: int,
@@ -1828,6 +1842,10 @@ async def execute_ordered_performer(
             )
 
         performer, order, site_model = row
+        # The spender's sign-in and the purchase wait on the site: end the
+        # transaction first, as PgBouncer cuts one left idle.
+        session.expire_on_commit = False
+        session.commit()
 
         # For PPV items that already have a spender recorded, prefer that auth
         # so the same account that bought the PPV is used for re-execution/S+D.
@@ -1905,6 +1923,8 @@ async def execute_ordered_performer(
             order.status = _derive_order_status(all_items)
             order.total_price = _recalculate_order_total(all_items)
             order.touch()
+            # Keep the purchase before the follow-up calls to the site.
+            session.commit()
 
             await _refresh_spender_balance_after_purchase(
                 site=site_model.name,
@@ -2255,6 +2275,11 @@ async def execute_order(
                 .scalars()
                 .all()
             )
+            # Purchases and sign-ins below wait on the site, which can take
+            # minutes: end the transaction first, as PgBouncer cuts one left idle.
+            # Nothing reads the database again until the closing commit.
+            session.expire_on_commit = False
+            session.commit()
 
             completed_count = 0
             failed_count = 0
@@ -2608,12 +2633,11 @@ async def execute_order(
                     len(successful_purchases),
                     order_id,
                 )
-                for auth_id, user_id, username in successful_purchases:
-                    spawn_background_task(
-                        _create_scrape_download_job(
-                            site.name, auth_id, user_id, username, backend_manager
-                        )
+                spawn_background_task(
+                    _create_scrape_download_jobs(
+                        site.name, list(successful_purchases), backend_manager
                     )
+                )
 
             summary = _build_order_summary(order, len(items))
             return OrderDetailResponse(
