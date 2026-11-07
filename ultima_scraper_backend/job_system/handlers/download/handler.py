@@ -466,6 +466,18 @@ async def _download_content_batch(
             return f"Download in progress: {downloaded_processed}/{total_downloads}"
         return "Download in progress"
 
+    def task_expected_bytes(batch_expected_bytes: int) -> int:
+        """The task's bytes to write: earlier pages' plus this batch's, at least the estimate.
+
+        The estimate counts only sizes known before downloading, so it can be far
+        below what the files turn out to be; this batch's expected bytes grow as
+        each file's real size is learned, and never fall below what it wrote.
+        """
+        return max(
+            int(aggregate["expected_bytes"]),
+            int(aggregate.get("bytes_written", 0)) + max(int(batch_expected_bytes), 0),
+        )
+
     async def persist_download_task_progress(
         *,
         downloaded_completed: int,
@@ -515,7 +527,7 @@ async def _download_content_batch(
                 + processed_bytes_count,
                 "bytes_transferred": aggregate.get("bytes_transferred", 0)
                 + transferred_bytes_count,
-                "total_bytes": aggregate["expected_bytes"],
+                "total_bytes": task_expected_bytes(expected_bytes_count),
                 "speed_bps": speed_bps,
                 "avg_speed_bps": avg_speed_bps,
                 "download_items_total": aggregate["total_items"],
@@ -594,7 +606,9 @@ async def _download_content_batch(
                 + aggregate.get("bytes_transferred", 0),
                 processed_bytes=int(event_dict.get("processed_bytes") or 0)
                 + aggregate.get("bytes_written", 0),
-                expected_bytes=aggregate["expected_bytes"],
+                expected_bytes=task_expected_bytes(
+                    int(event_dict.get("expected_bytes") or 0)
+                ),
             )
             await publish_download_progress(event_dict)
 
