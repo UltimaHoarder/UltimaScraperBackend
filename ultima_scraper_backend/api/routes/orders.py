@@ -71,8 +71,22 @@ async def _refresh_spender_balance_after_purchase(
 
     refreshed_user: object | None = None
 
+    # Only /users/me carries the account's own balance; the profile kept from
+    # login, and possibly /users/{id}, still have the old one after a top-up.
+    get_me_attr = getattr(authed, "get_me", None)
+    if callable(get_me_attr):
+        try:
+            refreshed_user = await cast(Callable[[], Awaitable[object]], get_me_attr)()
+        except Exception as exc:
+            logger.debug(
+                "Failed to refresh spender %s via get_me on %s: %s",
+                auth_id,
+                site_name,
+                exc,
+            )
+
     get_user_attr = getattr(authed, "get_user", None)
-    if callable(get_user_attr):
+    if refreshed_user is None and callable(get_user_attr):
         try:
             refreshed_user = await cast(
                 Callable[..., Awaitable[object]], get_user_attr
@@ -95,21 +109,6 @@ async def _refresh_spender_balance_after_purchase(
             except Exception as exc:
                 logger.debug(
                     "Failed to refresh spender %s via get_authed_user on %s: %s",
-                    auth_id,
-                    site_name,
-                    exc,
-                )
-
-    if refreshed_user is None:
-        get_me_attr = getattr(authed, "get_me", None)
-        if callable(get_me_attr):
-            try:
-                refreshed_user = await cast(
-                    Callable[[], Awaitable[object]], get_me_attr
-                )()
-            except Exception as exc:
-                logger.debug(
-                    "Failed to refresh spender %s via get_me on %s: %s",
                     auth_id,
                     site_name,
                     exc,
@@ -1980,12 +1979,43 @@ async def execute_ordered_performer(
         )
 
 
+async def _refresh_spender_balances(site: str, backend_manager: BackendManager) -> None:
+    """Fetch and store every spender's balance, so a top-up is used.
+
+    Calculating and executing an order read balances from the database.
+    """
+    for auth_id, _spender_type in _get_candidate_auth_ids(site):
+        try:
+            authed = await backend_manager.get_authed_session(site, auth_id)
+            if authed is not None:
+                await _refresh_spender_balance_after_purchase(
+                    site=site, authed=authed, auth_id=auth_id
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not refresh spender %s balance on %s: %s", auth_id, site, exc
+            )
+
+
 @router.post("/{order_id}/check", response_model=OrderDetailResponse)
-async def check_order(order_id: int) -> OrderDetailResponse:
-    """Check all users in an order and refresh their details."""
+async def check_order(
+    order_id: int,
+    backend_manager: BackendManager = Depends(get_backend_manager),
+) -> OrderDetailResponse:
+    """Refresh the spenders' balances, then return the order."""
     ensure_orders_schema()
 
     try:
+        # Outside the session below: no transaction stays open over the site.
+        with create_orders_session() as session:
+            site_name = session.execute(
+                sa_select(SiteModel.name)
+                .join(OrderModel, OrderModel.site_id == SiteModel.id)
+                .where(OrderModel.id == order_id)
+            ).scalar_one_or_none()
+        if site_name:
+            await _refresh_spender_balances(site_name, backend_manager)
+
         with create_orders_session() as session:
             order = session.execute(
                 sa_select(OrderModel).where(OrderModel.id == order_id)
