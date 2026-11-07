@@ -356,7 +356,9 @@ def _central_task_row_to_detail(
             proxy_hop_used = metrics.get("resolved_route_index")
 
     if not proxy_routes and archived_payload and isinstance(archived_payload, dict):
-        if (
+        # Only a guest task's routes are in its payload; a signed-in one uses its
+        # account's proxy, chosen when a worker claims it, so none is known yet.
+        if archived_payload.get("use_guest_auth") and (
             "guest_proxy_url" in archived_payload
             or "guest_fallback_proxy_urls" in archived_payload
         ):

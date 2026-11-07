@@ -41,7 +41,6 @@ from ultima_scraper_backend.redis_events import JsonValue, publish_ws_event
 
 from ....database.write_queue import DatabaseWriteOperation, stable_command_id
 from ...download_manager import DownloadItem, DownloadManager, _build_temp_merge_path
-from ...drive_selection import select_user_destination
 from ...metadata_models import ContentMetadata
 from ...models import (
     Task,
@@ -303,16 +302,21 @@ async def download_task_handler(
 
     # Handle profile content type separately
     if content_type_value == "profile":
-        return await _handle_profile_download(
-            task=task,
-            context=context,
-            user=user,
-            db_user=db_user,
-            db_manager=db_manager,
-            authed=authed,
-            user_manager=user_manager,
-            config=config,
-        )
+        from ....offload.remote import open_offload
+
+        # A backend without drives hands profile media over too, like other media.
+        async with open_offload(config, getattr(context, "redis", None)) as offload:
+            return await _handle_profile_download(
+                task=task,
+                context=context,
+                user=user,
+                db_user=db_user,
+                db_manager=db_manager,
+                authed=authed,
+                user_manager=user_manager,
+                config=config,
+                offload=offload,
+            )
 
     from .streaming import download_selected_media
 
@@ -1761,6 +1765,7 @@ async def _handle_profile_download(
     authed: Any,
     user_manager: Any,
     config: Any,
+    offload: Any = None,
 ) -> TaskResult:
     """Handle downloading profile media (avatar and header).
 
@@ -1777,6 +1782,7 @@ async def _handle_profile_download(
         authed: Authenticated API user
         user_manager: User directory manager
         config: Application config
+        offload: The backends to hand files to, when this one has no drive
 
     Returns:
         TaskResult with download results
@@ -1825,8 +1831,11 @@ async def _handle_profile_download(
     # Resolve proxy URL
     proxy_url = _resolve_proxy_url(authed, db_manager)
 
-    # Select destination directory
-    destination_selection = select_user_destination(
+    from .streaming import _destination
+
+    # Select destination directory: this backend's drive, or the owner's mirror here
+    destination_selection, remote = await _destination(
+        offload,
         user_id=user_id,
         usernames=user.get_usernames(),
         site_name=site_name,
@@ -1915,15 +1924,16 @@ async def _handle_profile_download(
             continue
         filepath = item.directory / item.filename
         if filepath.exists():
-            download_results.append(
-                DownloadResultItem(
-                    media_id=item.media_id or 0,
-                    content_id=item.content_id,
-                    status="skipped",
-                    path=str(filepath),
-                    bytes_written=0,
-                )
+            existing = DownloadResultItem(
+                media_id=item.media_id or 0,
+                content_id=item.content_id,
+                status="skipped",
+                path=str(filepath),
+                bytes_written=0,
             )
+            # Left in the mirror by a hand-over that failed: sent again below.
+            existing.add_error(DownloadFailureReason.ALREADY_EXISTS, "Profile media already exists")
+            download_results.append(existing)
             written.append(
                 {
                     "path": str(filepath),
@@ -1987,6 +1997,15 @@ async def _handle_profile_download(
                         "failed": True,
                     }
                 )
+
+    if remote is not None:
+        await _hand_over(remote, download_results)
+        # Each written entry pairs with the result appended beside it.
+        for entry, result in zip(written, download_results):
+            entry["path"] = result.path
+            if result.status == "failed" and not entry["failed"]:
+                entry["failed"] = True
+                bytes_written -= entry["bytes"]
 
     success_count = sum(1 for r in download_results if r.status == "downloaded")
     skip_count = sum(1 for r in download_results if r.status == "skipped")
