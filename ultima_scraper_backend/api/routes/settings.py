@@ -1309,12 +1309,10 @@ async def list_backend_inventory(
             stmt = stmt.where(BackendInventoryModel.hostname == hostname)
         stmt = stmt.order_by(BackendInventoryModel.hostname.asc())
         rows = session.exec(stmt).all()
+        # Serialised while the session is open. Backends share settings rows,
+        # so detaching one row per backend would detach a shared row twice.
         for row in rows:
-            settings_row = row.settings
-            session.expunge(row)
-            if settings_row is not None:
-                session.expunge(settings_row)
-            records.append(_serialize_backend_inventory(row, settings_row))
+            records.append(_serialize_backend_inventory(row, row.settings))
     return records
 
 
