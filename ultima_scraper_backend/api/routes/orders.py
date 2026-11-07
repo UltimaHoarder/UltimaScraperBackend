@@ -1603,7 +1603,18 @@ async def create_ordered_performer(
             performer.status = "pending"
             performer.error_message = "No spender with sufficient balance"
             performer.touch()
-            order.status = "pending"
+            session.flush()
+            all_items = list(
+                session.execute(
+                    sa_select(OrderedPerformerModel)
+                    .where(OrderedPerformerModel.order_id == order.id)
+                    .order_by(OrderedPerformerModel.created_at.asc())
+                )
+                .scalars()
+                .all()
+            )
+            order.status = _derive_order_status(all_items)
+            order.total_price = _recalculate_order_total(all_items)
             order.touch()
             return OrderedPerformerCreateResponse(
                 success=True,
@@ -1634,15 +1645,24 @@ async def create_ordered_performer(
                 authed, user_id, username, site
             )
         performer.price = _merge_execution_price(performer.price, resolved_price)
-        order.total_price = performer.price
-
         performer.spender_user_id = spender_id
         order.spender_user_id = spender_id
 
         if ok:
             performer.status = "completed"
-            order.status = "completed"
             performer.touch()
+            session.flush()
+            all_items = list(
+                session.execute(
+                    sa_select(OrderedPerformerModel)
+                    .where(OrderedPerformerModel.order_id == order.id)
+                    .order_by(OrderedPerformerModel.created_at.asc())
+                )
+                .scalars()
+                .all()
+            )
+            order.status = _derive_order_status(all_items)
+            order.total_price = _recalculate_order_total(all_items)
             order.touch()
 
             await _refresh_spender_balance_after_purchase(
@@ -1682,7 +1702,18 @@ async def create_ordered_performer(
         performer.status = "failed"
         performer.error_message = error_message
         performer.touch()
-        order.status = "failed"
+        session.flush()
+        all_items = list(
+            session.execute(
+                sa_select(OrderedPerformerModel)
+                .where(OrderedPerformerModel.order_id == order.id)
+                .order_by(OrderedPerformerModel.created_at.asc())
+            )
+            .scalars()
+            .all()
+        )
+        order.status = _derive_order_status(all_items)
+        order.total_price = _recalculate_order_total(all_items)
         order.touch()
         return OrderedPerformerCreateResponse(
             success=False,
@@ -1816,7 +1847,18 @@ async def execute_ordered_performer(
             performer.status = "pending"
             performer.error_message = "No spender with sufficient balance"
             performer.touch()
-            order.status = "pending"
+            session.flush()
+            all_items = list(
+                session.execute(
+                    sa_select(OrderedPerformerModel)
+                    .where(OrderedPerformerModel.order_id == order.id)
+                    .order_by(OrderedPerformerModel.created_at.asc())
+                )
+                .scalars()
+                .all()
+            )
+            order.status = _derive_order_status(all_items)
+            order.total_price = _recalculate_order_total(all_items)
             order.touch()
             return OrderedPerformerActionResponse(
                 success=True,
@@ -1843,16 +1885,25 @@ async def execute_ordered_performer(
             )
 
         performer.price = _merge_execution_price(performer.price, resolved_price)
-        order.total_price = performer.price
-
         performer.spender_user_id = spender_id
         order.spender_user_id = spender_id
 
         if ok:
             performer.status = "completed"
-            order.status = "completed"
             performer.error_message = None
             performer.touch()
+            session.flush()
+            all_items = list(
+                session.execute(
+                    sa_select(OrderedPerformerModel)
+                    .where(OrderedPerformerModel.order_id == order.id)
+                    .order_by(OrderedPerformerModel.created_at.asc())
+                )
+                .scalars()
+                .all()
+            )
+            order.status = _derive_order_status(all_items)
+            order.total_price = _recalculate_order_total(all_items)
             order.touch()
 
             await _refresh_spender_balance_after_purchase(
@@ -1889,7 +1940,18 @@ async def execute_ordered_performer(
         performer.status = "failed"
         performer.error_message = error_message
         performer.touch()
-        order.status = "failed"
+        session.flush()
+        all_items = list(
+            session.execute(
+                sa_select(OrderedPerformerModel)
+                .where(OrderedPerformerModel.order_id == order.id)
+                .order_by(OrderedPerformerModel.created_at.asc())
+            )
+            .scalars()
+            .all()
+        )
+        order.status = _derive_order_status(all_items)
+        order.total_price = _recalculate_order_total(all_items)
         order.touch()
         return OrderedPerformerActionResponse(
             success=False,
@@ -2639,7 +2701,7 @@ async def delete_ordered_performer(performer_id: int) -> OrderDetailResponse:
                 )
 
             session.delete(performer)
-            order.touch()
+            session.flush()
 
             items = (
                 session.execute(
@@ -2718,6 +2780,7 @@ async def delete_all_ordered_ppv(order_id: int) -> OrderDetailResponse:
             session.execute(
                 delete(OrderedPpvModel).where(OrderedPpvModel.order_id == order_id)
             )
+            session.flush()
 
             items = (
                 session.execute(
@@ -2729,6 +2792,7 @@ async def delete_all_ordered_ppv(order_id: int) -> OrderDetailResponse:
                 .all()
             )
 
+            order.status = _derive_order_status(list(items))
             order.total_price = _recalculate_order_total(list(items))
             order.touch()
 
