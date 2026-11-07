@@ -5,7 +5,14 @@ from pathlib import Path
 from typing import Any, Literal, Self, cast
 from urllib.parse import unquote, urlparse
 
-from pydantic import BaseModel, Field, PrivateAttr, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 from ultima_scraper_api.config import DRM as USAPIDRM
 from ultima_scraper_api.config import FanslyAPIConfig as USAFanslyAPIConfig
 from ultima_scraper_api.config import LoyalFansAPIConfig as USALoyalFansAPIConfig
@@ -83,10 +90,20 @@ class Proxy(BaseModel):
     password: str | None = None
     enabled: bool = True
     max_connections: int = -1
-    downloads: DownloadSettings = DownloadSettings()
+    # None: the network's download settings apply to this proxy.
+    downloads: DownloadSettings | None = None
     group: str | None = None
     managed_by: PluginProxyOwner | None = None
     guest_lookup_timeout: float | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_downloads(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # Saved without the key, not as null, which backends from before
+        # downloads became optional reject.
+        data = handler(self)
+        if data.get("downloads") is None:
+            data.pop("downloads", None)
+        return data
 
     def to_usapi_proxy(self) -> USAPIProxy:
         return USAPIProxy(

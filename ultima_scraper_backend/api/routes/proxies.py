@@ -19,7 +19,7 @@ from ultima_scraper_api.config import ProxyGroupSettings
 from sqlmodel import select
 from ultima_scraper_db_archive import UserAuthModel
 
-from ...config import Proxy, UltimaScraperCollectionConfig
+from ...config import DownloadSettings, Network, Proxy, UltimaScraperCollectionConfig
 from ...config_settings_sync import (
     ConfigVersionConflict,
     ConfigVersionRequired,
@@ -68,6 +68,13 @@ def _mask_proxy_url(raw_proxy_url: object) -> str | None:
         return None
     port = f":{parsed.port}" if parsed.port else ""
     return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
+def _own_downloads(proxy: Proxy, network: Network) -> DownloadSettings:
+    """The proxy's own download settings, started from the network's."""
+    if proxy.downloads is None:
+        proxy.downloads = network.downloads.model_copy()
+    return proxy.downloads
 
 
 def _persist_proxy_config(config: UltimaScraperCollectionConfig) -> None:
@@ -2443,7 +2450,7 @@ async def update_group_settings(
         if update_data.max_connections is not None:
             proxy.max_connections = update_data.max_connections
         if update_data.max_concurrency is not None:
-            proxy.downloads.max_concurrency = update_data.max_concurrency
+            _own_downloads(proxy, config.settings.network).max_concurrency = update_data.max_concurrency
         if update_data.enabled is not None:
             proxy.enabled = update_data.enabled
 
@@ -2534,7 +2541,7 @@ async def bulk_edit_proxies(
             if request.max_connections is not None:
                 proxy.max_connections = request.max_connections
             if request.max_concurrency is not None:
-                proxy.downloads.max_concurrency = request.max_concurrency
+                _own_downloads(proxy, config.settings.network).max_concurrency = request.max_concurrency
             if request.guest_lookup_timeout is not None:
                 proxy.guest_lookup_timeout = request.guest_lookup_timeout
             updated_count += 1
@@ -2697,7 +2704,7 @@ async def update_proxy(
     if update_data.max_connections is not None:
         proxy.max_connections = update_data.max_connections
     if update_data.max_concurrency is not None:
-        proxy.downloads.max_concurrency = update_data.max_concurrency
+        _own_downloads(proxy, config.settings.network).max_concurrency = update_data.max_concurrency
     if "group" in update_data.model_fields_set:
         proxy.group = update_data.group or None
     if "guest_lookup_timeout" in update_data.model_fields_set:
@@ -2711,7 +2718,7 @@ async def update_proxy(
         password="***",
         enabled=proxy.enabled,
         max_connections=proxy.max_connections,
-        max_concurrency=proxy.downloads.max_concurrency,
+        max_concurrency=(proxy.downloads or config.settings.network.downloads).max_concurrency,
         group=getattr(proxy, "group", None),
         guest_lookup_timeout=getattr(proxy, "guest_lookup_timeout", None),
     )
