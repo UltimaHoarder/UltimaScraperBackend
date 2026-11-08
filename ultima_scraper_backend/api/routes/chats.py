@@ -1471,7 +1471,7 @@ async def send_message(
             id=int(msg_data.get("id", 0) or 0),
             text=request.text,
             from_user_id=int(auth.id),
-            from_username=auth.username,
+            from_username=auth.username or f"user_{int(auth.id)}",
             is_from_me=True,
             created_at=created_at.isoformat(),
             is_tip=False,
