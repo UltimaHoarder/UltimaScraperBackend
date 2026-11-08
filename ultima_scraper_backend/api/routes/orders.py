@@ -993,7 +993,12 @@ async def _select_spender(
 
     candidates: list[tuple[float, auth_types, int]] = []
     for auth_id, _spender_type in candidate_auth_ids:
-        authed = await backend_manager.get_authed_session(site, auth_id)
+        authed = await _get_cached_authed_session(
+            site=site,
+            auth_id=auth_id,
+            backend_manager=backend_manager,
+            auth_cache={},
+        )
         if not authed:
             continue
         get_authed_user = getattr(authed, "get_authed_user", None)
@@ -1040,6 +1045,17 @@ async def _get_cached_authed_session(
             auth_id,
             site,
         )
+    else:
+        # A purchase is checked against the balance kept on this session, which
+        # another API process's refresh or a top-up on the site doesn't reach.
+        try:
+            await _refresh_spender_balance_after_purchase(
+                site=site, authed=authed, auth_id=auth_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not refresh spender %s balance on %s: %s", auth_id, site, exc
+            )
     return authed
 
 
@@ -1850,8 +1866,11 @@ async def execute_ordered_performer(
         # so the same account that bought the PPV is used for re-execution/S+D.
         selection: tuple[auth_types, int, float | None] | None = None
         if performer.post_id is not None and performer.spender_user_id is not None:
-            prev_authed = await backend_manager.get_authed_session(
-                site_model.name, performer.spender_user_id
+            prev_authed = await _get_cached_authed_session(
+                site=site_model.name,
+                auth_id=performer.spender_user_id,
+                backend_manager=backend_manager,
+                auth_cache={},
             )
             if prev_authed:
                 selection = (prev_authed, performer.spender_user_id, None)
