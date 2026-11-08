@@ -14,6 +14,10 @@ from ultima_scraper_core.processes import finish_owned
 
 T = TypeVar("T")
 _database_limiter: RunVar[CapacityLimiter] = RunVar("interactive_database_limiter")
+_api_command_limiter: RunVar[CapacityLimiter] = RunVar("api_command_admission_limiter")
+# Half the API's connection pool: a page's burst of commands queues here, where
+# there's no timeout, and leaves connections for everything else.
+API_COMMAND_ADMISSION_LIMIT = 4
 
 
 def database_thread_limiter() -> CapacityLimiter:
@@ -35,6 +39,15 @@ def database_thread_limiter() -> CapacityLimiter:
         _database_limiter.set(limiter)
     elif limiter.total_tokens != limit:
         limiter.total_tokens = limit
+    return limiter
+
+
+def api_command_admission_limiter() -> CapacityLimiter:
+    """Bound how many worker API commands are written to SQL at once."""
+    limiter = _api_command_limiter.get(None)
+    if limiter is None:
+        limiter = CapacityLimiter(API_COMMAND_ADMISSION_LIMIT)
+        _api_command_limiter.set(limiter)
     return limiter
 
 

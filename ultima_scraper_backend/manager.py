@@ -55,6 +55,7 @@ from ultima_scraper_backend.websocket_actions import (
 
 from .backend_result import BackendResult
 from .content_persistence import ContentPersistenceMixin
+from .database.threads import api_command_admission_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -2719,15 +2720,16 @@ class BackendManager(ContentPersistenceMixin):
         )
 
         try:
-            prepared_job = await self._job_manager.prepare_job(
-                job,
-                priority=priority,
-            )
-            await self._job_manager.activate_job(
-                prepared_job,
-                distributed_mode=True,
-                priority=priority,
-            )
+            async with api_command_admission_limiter():
+                prepared_job = await self._job_manager.prepare_job(
+                    job,
+                    priority=priority,
+                )
+                await self._job_manager.activate_job(
+                    prepared_job,
+                    distributed_mode=True,
+                    priority=priority,
+                )
         except Exception as exc:
             logger.exception(
                 "Failed to dispatch worker API command %s for %s", command, site_key
