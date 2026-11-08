@@ -8,6 +8,11 @@ cache, grow with job history. Finished runs keep task and attempt history for
 job views; their outbox and mutation leaves are dropped once the run has been
 terminal for the grace period, all its events are delivered and every
 event-reading plugin has consumed them.
+
+Worker API commands are the exception: one page of profiles starts dozens, and
+nothing reads their task rows once the caller has its answer. All of a
+successful command's leaves go shortly after it finishes. A failed command's
+task and attempt leaves last as long as other jobs' full task history.
 """
 
 import logging
@@ -18,6 +23,7 @@ from sqlalchemy.exc import DBAPIError
 
 from ultima_scraper_core import runtime_env_value
 
+from .history_compaction import retention_days
 from .job_partitions import (
     RETIRED_TABLES,
     _drop_partition,
@@ -30,6 +36,11 @@ DEFAULT_RETIRE_AFTER_SECONDS = 3600
 IDENTITY_BATCH = 5000
 CYCLE_LIMIT = 64
 CYCLE_BUDGET_SECONDS = 10.0
+# Well past the two minutes a caller waits for a command's result.
+API_COMMAND_GRACE_SECONDS = 600
+API_COMMAND_CYCLE_LIMIT = 300
+API_COMMAND_CYCLE_BUDGET_SECONDS = 30.0
+TASK_HISTORY_TABLES = ("job_tasks", "execution_attempts")
 STATUS_KEY = "ultimascraper:database:history-retirement:status"
 CURSOR_KEY = "ultimascraper:database:history-retirement:identity-cursors"
 TERMINAL = ("completed", "failed", "cancelled")
@@ -60,6 +71,36 @@ WHERE i.inhparent IN (to_regclass('management.execution_outbox'),
 -- Mutation leaves need no delivery check. Release them first, then eligible
 -- event leaves, before spending the remaining budget on directory cleanup.
 ORDER BY p.relname = 'execution_outbox', r.completed_at, r.run_id
+LIMIT :limit
+""")
+
+_API_COMMAND_CANDIDATES = text(r"""
+SELECT r.run_id, p.relname AS history_table, r.state = 'completed' AS succeeded
+FROM pg_inherits i
+JOIN pg_class c ON c.oid=i.inhrelid
+JOIN pg_class p ON p.oid=i.inhparent
+JOIN management.execution_runs r
+  ON r.run_id=replace(
+       substring(pg_get_expr(c.relpartbound, c.oid) FROM '^FOR VALUES IN \(''(.*)''\)$'),
+       '''''', '''')
+WHERE i.inhparent IN (to_regclass('management.execution_outbox'),
+                      to_regclass('management.execution_mutations'),
+                      to_regclass('management.job_tasks'),
+                      to_regclass('management.execution_attempts'))
+  AND c.relname ~ '_job_[0-9a-f]{32}$'
+  AND r.run_id LIKE 'api-%'
+  AND r.state IN ('completed','failed','cancelled')
+  AND (
+    (r.state = 'completed'
+     AND r.completed_at < clock_timestamp() - make_interval(secs => :grace))
+    -- A NULL grace keeps failures' task history for as long as the setting does.
+    OR (p.relname IN ('job_tasks','execution_attempts')
+        AND r.completed_at < clock_timestamp()
+            - make_interval(secs => CAST(:failed_grace AS double precision)))
+  )
+  AND coalesce(r.config_json::jsonb->'metadata'->>'deletion_pending', '') <> 'true'
+  AND NOT (r.run_id = ANY(CAST(:protected AS text[])))
+ORDER BY r.completed_at, r.run_id, p.relname
 LIMIT :limit
 """)
 
@@ -176,6 +217,10 @@ def _drop_leaf(factory, run_id, table, grace, floor):
         if not _owned_partition(session, run_id, table):
             return False
         dropped = _drop_partition(session, run_id, table)
+        if dropped and table in TASK_HISTORY_TABLES:
+            # DROP fires no row triggers. A command's handful of rows always
+            # fits one page, so its directory entries go with the leaf.
+            purge_identity_page(session, table, run_id, IDENTITY_BATCH)
         session.commit()
     return dropped
 
@@ -260,6 +305,53 @@ def retire_finished_history(
     return counts
 
 
+def retire_finished_api_commands(
+    *,
+    protected_run_ids=frozenset(),
+    grace_seconds=API_COMMAND_GRACE_SECONDS,
+    failed_days=None,
+    session_factory=None,
+    limit=API_COMMAND_CYCLE_LIMIT,
+    budget_seconds=API_COMMAND_CYCLE_BUDGET_SECONDS,
+):
+    """Drop finished API commands' leaves, oldest first, within a time budget."""
+    from ultima_scraper_db_archive.global_db import global_session
+
+    from .outbox_retention import _plugin_event_floor
+
+    factory = session_factory or global_session
+    deadline = time.monotonic() + budget_seconds
+    with factory() as session:
+        days = retention_days(session) if failed_days is None else failed_days
+        failed_grace = days * 86400 if days > 0 else None
+        floor = _plugin_event_floor(session)
+        candidates = session.execute(
+            _API_COMMAND_CANDIDATES,
+            {
+                "grace": grace_seconds,
+                "failed_grace": failed_grace,
+                "protected": sorted(protected_run_ids),
+                "limit": limit,
+            },
+        ).all()
+        session.commit()
+    counts = {"retired": 0, "busy": 0, "waiting": 0}
+    for run_id, table, succeeded in candidates:
+        if time.monotonic() >= deadline:
+            break
+        grace = grace_seconds if succeeded else failed_grace
+        try:
+            if _drop_leaf(factory, run_id, table, grace, floor):
+                counts["retired"] += 1
+            else:
+                counts["waiting"] += 1
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) not in RETRYABLE_SQLSTATES:
+                raise
+            counts["busy"] += 1
+    return counts
+
+
 async def run_history_retirement_cycle(redis_manager):
     from .receipt_retention import pending_run_ids, retention_mode
     from .threads import run_database_call
@@ -278,6 +370,10 @@ async def run_history_retirement_cycle(redis_manager):
     counts = await run_database_call(
         retire_finished_history, protected_run_ids=protected, identity_cursors=cursors
     )
+    api_commands = await run_database_call(
+        retire_finished_api_commands, protected_run_ids=protected
+    )
+    counts = {key: counts[key] + api_commands[key] for key in counts}
     stale = previous_keys - set(cursors)
     if stale:
         await redis_manager.client.hdel(CURSOR_KEY, *stale)

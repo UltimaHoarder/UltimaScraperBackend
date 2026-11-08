@@ -20,8 +20,9 @@ IDENTITY_SWEEP_PAGES = 128
 IDENTITY_SWEEP_MIN_ROWS = 1_000_000
 IDENTITY_SWEEP_MIN_SHARE = 0.1
 PARENT = "management.execution_mutations"
-# Finished runs keep task and attempt history for job views. Their delivered
-# events and idempotency mutations are retired (see history_retirement).
+# Finished runs keep task and attempt history for job views, except API
+# commands. Their delivered events and idempotency mutations are retired (see
+# history_retirement).
 RETIRED_TABLES = ("execution_outbox", "execution_mutations")
 
 

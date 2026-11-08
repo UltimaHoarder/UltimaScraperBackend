@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 _ELIGIBLE = """
   r.state IN ('completed','failed','cancelled')
+  AND r.run_id NOT LIKE 'api-%'
   AND r.completed_at < clock_timestamp() - make_interval(days => :days)
   AND coalesce(r.config_json::jsonb->'metadata'->>'deletion_pending', '') <> 'true'
   AND NOT (r.run_id = ANY(CAST(:protected AS text[])))
