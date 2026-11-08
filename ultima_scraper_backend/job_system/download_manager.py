@@ -520,6 +520,8 @@ class DownloadManager:
         self._processed_bytes = 0
         self._expected_bytes_by_item: dict[int, int] = {}
         self._processed_parts_by_item: dict[int, dict[int, int]] = {}
+        # Files that have started moving bytes and have not finished.
+        self._transferring_items: dict[int, DownloadItem] = {}
 
         # Callbacks
         self.on_progress: list[ProgressCallback] = []
@@ -568,6 +570,7 @@ class DownloadManager:
         self._processed_bytes = 0
         self._expected_bytes_by_item.clear()
         self._processed_parts_by_item.clear()
+        self._transferring_items.clear()
 
     def _begin_item_progress(
         self, item: DownloadItem, *, expected_precounted: bool
@@ -581,6 +584,7 @@ class DownloadManager:
         # Aggregate counters survive completion; per-item state does not.
         self._expected_bytes_by_item.pop(id(item), None)
         self._processed_parts_by_item.pop(id(item), None)
+        self._transferring_items.pop(id(item), None)
 
     def _record_expected_bytes(self, item: DownloadItem, expected_bytes: int) -> None:
         expected = max(int(expected_bytes or 0), 0)
@@ -626,13 +630,37 @@ class DownloadManager:
     def _processed_transfer_bytes(self) -> int:
         return self._processed_bytes
 
+    @staticmethod
+    def _item_destination(item: DownloadItem) -> str | None:
+        # A progress report must never be what fails a transfer.
+        try:
+            return str(item.get_filepath())
+        except ValueError:
+            return None
+
+    def _active_transfers(self, finished: DownloadItem | None) -> list[dict[str, Any]]:
+        """Every file moving bytes now, leaving out one just reported as finished."""
+        transfers: list[dict[str, Any]] = []
+        for item in self._transferring_items.values():
+            if item is finished:
+                continue
+            processed, expected = self._item_transfer_bytes(item)
+            transfers.append(
+                {
+                    "media_id": item.media_id,
+                    "path": self._item_destination(item),
+                    "processed_bytes": processed,
+                    "expected_bytes": expected,
+                }
+            )
+        return transfers
+
     async def _emit_transfer_progress(
         self,
         item: DownloadItem,
         *,
         status: Literal["progress", "completed", "failed"],
         force: bool = False,
-        path: str | None = None,
     ) -> None:
         if not self.on_progress:
             return
@@ -666,7 +694,10 @@ class DownloadManager:
                     "item_processed_bytes": item_processed,
                     "item_expected_bytes": item_expected,
                     "duration": now - self._transfer_started_at,
-                    "path": path,
+                    "path": self._item_destination(item),
+                    "active_transfers": self._active_transfers(
+                        None if status == "progress" else item
+                    ),
                     "completed": self.completed,
                     "failed": self.failed,
                     "total": self.total,
@@ -679,6 +710,7 @@ class DownloadManager:
         chunk_size: int,
     ) -> None:
         self._transferred_bytes += max(int(chunk_size), 0)
+        self._transferring_items[id(item)] = item
         await self._emit_transfer_progress(item, status="progress")
 
     def _staging_headroom_bytes(self, directory: StagingDirectory) -> int:
@@ -1129,7 +1161,6 @@ class DownloadManager:
             item,
             status="completed",
             force=True,
-            path=str(item.get_filepath()),
         )
         return True
 
@@ -1142,7 +1173,6 @@ class DownloadManager:
             item,
             status="failed",
             force=True,
-            path=str(item.get_filepath()),
         )
         return False
 

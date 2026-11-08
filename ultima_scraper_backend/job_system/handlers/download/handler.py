@@ -453,18 +453,19 @@ async def _download_content_batch(
     def build_download_progress_message(
         *,
         downloaded_processed: int,
-        drm_processed: int,
+        processed_count: int,
+        total_count: int,
         drm_message: str = "",
     ) -> str:
+        # The counts are the whole task's; downloaded_processed is this batch's.
         if total_drm_items > 0 and downloaded_processed >= total_downloads:
-            base_message = f"DRM merge in progress: {drm_processed}/{total_drm_items}"
-            if drm_processed >= total_drm_items:
-                base_message = f"DRM merge complete: {drm_processed}/{total_drm_items}"
+            state = "complete" if processed_count >= total_count else "in progress"
+            base_message = f"DRM merge {state}: {processed_count}/{total_count}"
             if drm_message:
                 return f"{base_message} ({drm_message})"
             return base_message
-        if total_downloads > 0:
-            return f"Download in progress: {downloaded_processed}/{total_downloads}"
+        if total_count > 0:
+            return f"Download in progress: {processed_count}/{total_count}"
         return "Download in progress"
 
     def task_expected_bytes(batch_expected_bytes: int) -> int:
@@ -508,7 +509,8 @@ async def _download_content_batch(
         total_count = max(aggregate["progress_total"], processed_count)
         message = build_download_progress_message(
             downloaded_processed=downloaded_processed,
-            drm_processed=drm_processed,
+            processed_count=processed_count,
+            total_count=total_count,
             drm_message=drm_message,
         )
 
@@ -523,6 +525,7 @@ async def _download_content_batch(
                 "downloads_completed": aggregate.get("successful", 0)
                 + downloaded_completed,
                 "failed": aggregate.get("failed", 0) + failed_count,
+                "skipped": aggregate.get("skipped", 0),
                 "total_items": total_count,
                 "bytes_written": aggregate.get("bytes_written", 0)
                 + processed_bytes_count,
@@ -615,6 +618,7 @@ async def _download_content_batch(
                 # The file named by media_id; the fields above are the whole task's.
                 media_processed_bytes=dm_event.get("item_processed_bytes"),
                 media_expected_bytes=dm_event.get("item_expected_bytes"),
+                active_transfers=dm_event.get("active_transfers"),
             )
             await publish_download_progress(event_dict)
 
