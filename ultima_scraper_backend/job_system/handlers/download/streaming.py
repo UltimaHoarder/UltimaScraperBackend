@@ -236,7 +236,11 @@ async def _download_selected_media(
     resolved_auth_id,
     offload,
 ):
-    from .handler import _download_content_batch, _resolve_proxy_url
+    from .handler import (
+        _download_content_batch,
+        _proxy_route_fields,
+        _resolve_proxy_url,
+    )
 
     paid_feed = bool(getattr(task.payload, "paid_content_feed", False))
     # Guest IDs identify ephemeral API sessions, not archive account scopes.
@@ -244,6 +248,14 @@ async def _download_selected_media(
     selection_auth_id = None if bool(getattr(authed, "guest", False)) else resolved_auth_id
     user_id = int(user.id) if user is not None else 0
     proxy_url = await asyncio.to_thread(_resolve_proxy_url, authed, db_manager)
+    # The route shows while the selection is prepared, before any progress.
+    task.result = TaskResult(
+        success=True,
+        message="Preparing the download",
+        output={},
+        metrics=_proxy_route_fields(proxy_url),
+    )
+    await context.storage.persist_task(job_id=context.job.job_id, task=task)
     resources = ResourceManager.from_config(config, proxy_url=proxy_url)
     batch_size = positive_budget(
         "ULTIMA_DOWNLOAD_BATCH_SIZE", resources.get_file_concurrency()
@@ -350,9 +362,7 @@ async def _download_selected_media(
                 "failure_breakdown": dict(failure_breakdown),
                 "selected_staging_directories": sorted(staging_directories),
                 "staging_fallback_items": counters["staging_fallback_items"],
-                "proxy_url": proxy_url,
-                "proxy_routes": [proxy_url] if proxy_url else [],
-                "proxy_hop_used": 0 if proxy_url else None,
+                **_proxy_route_fields(proxy_url),
             },
             metrics={
                 **counters,
@@ -370,9 +380,7 @@ async def _download_selected_media(
                 "success_rate": counters["successful"] / counters["valid_items"] * 100
                 if counters["valid_items"]
                 else 0.0,
-                "proxy_url": proxy_url,
-                "proxy_routes": [proxy_url] if proxy_url else [],
-                "proxy_hop_used": 0 if proxy_url else None,
+                **_proxy_route_fields(proxy_url),
             },
         )
 
@@ -451,6 +459,7 @@ async def _download_selected_media(
                     download_manager=manager,
                     aggregate=counters,
                     evidence_spec=spec,
+                    proxy_url=proxy_url,
                 )
                 output = result.output or {}
                 categories = [

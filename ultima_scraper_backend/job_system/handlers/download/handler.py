@@ -348,6 +348,7 @@ async def _download_content_batch(
     aggregate,
     evidence_spec,
     remote_store=None,
+    proxy_url=None,
 ):
     """Process one bounded metadata batch using the existing file/DRM pipeline.
 
@@ -533,6 +534,8 @@ async def _download_content_batch(
                 "download_items_total": aggregate["total_items"],
                 "drm_items_total": total_drm_items,
                 "drm_items_processed": drm_processed,
+                # Kept while it runs, so the task never reads as direct.
+                **_proxy_route_fields(proxy_url),
             },
             output={"media_evidence": evidence_spec},
             errors=[],
@@ -1173,6 +1176,15 @@ def _resolve_proxy_url(authed: Any, db_manager: Any) -> str | None:
         )
 
     return proxy_url
+
+
+def _proxy_route_fields(proxy_url: str | None) -> dict[str, Any]:
+    """A download task's route, in the fields the task views read from its result."""
+    return {
+        "proxy_url": proxy_url,
+        "proxy_routes": [proxy_url] if proxy_url else [],
+        "proxy_hop_used": 0 if proxy_url else None,
+    }
 
 
 def _build_filepath_rows(
@@ -2034,9 +2046,7 @@ async def _handle_profile_download(
             "files": written,
             "bytes_written": bytes_written,
             "download_results": [r.model_dump() for r in download_results],
-            "proxy_url": proxy_url,
-            "proxy_routes": [proxy_url] if proxy_url else [],
-            "proxy_hop_used": 0 if proxy_url else None,
+            **_proxy_route_fields(proxy_url),
         },
         message=f"Downloaded {success_count} profile media ({skip_count} skipped, {fail_count} failed)",
         metrics={
@@ -2046,8 +2056,6 @@ async def _handle_profile_download(
             "success_count": success_count,
             "skip_count": skip_count,
             "fail_count": fail_count,
-            "proxy_url": proxy_url,
-            "proxy_routes": [proxy_url] if proxy_url else [],
-            "proxy_hop_used": 0 if proxy_url else None,
+            **_proxy_route_fields(proxy_url),
         },
     )
