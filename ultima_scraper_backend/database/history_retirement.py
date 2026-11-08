@@ -48,7 +48,9 @@ TERMINAL = ("completed", "failed", "cancelled")
 # leaf takes ACCESS EXCLUSIVE on its parent, which queues behind relays and
 # writers; give up quickly and retry next cycle rather than stall them.
 LOCK_TIMEOUT = "500ms"
-RETRYABLE_SQLSTATES = {"55P03", "40P01", "40001"}
+# 42P01: every API process runs this cycle, and another one dropped the leaf
+# between the ownership check and reading it.
+RETRYABLE_SQLSTATES = {"55P03", "40P01", "40001", "42P01"}
 
 logger = logging.getLogger(__name__)
 
