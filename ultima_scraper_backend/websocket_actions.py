@@ -52,6 +52,19 @@ DEFAULT_LOCK_TTL = 30
 DEFAULT_SUBSCRIPTION_DAYS = 30
 
 
+def _renew_lapsed_subscription(subscription: SubscriptionModel) -> bool:
+    """Reactivate a saved subscription that a new subscribed event shows has lapsed."""
+    now = datetime.now(timezone.utc)
+    expires_at = subscription.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if subscription.active and (expires_at is None or expires_at > now):
+        return False
+    subscription.active = True
+    subscription.expires_at = now + timedelta(days=DEFAULT_SUBSCRIPTION_DAYS)
+    return True
+
+
 class UserInfoProtocol(Protocol):
     username: str | None
     credit_balance: float | None
@@ -1036,9 +1049,9 @@ class WebSocketActionHandler:
                         logger.info(
                             f"💾 Saved toast subscription: authed {authed_id} -> performer {username} ({subscriber_id})"
                         )
-                    else:
-                        logger.debug(
-                            f"Subscription already exists: authed -> {username}"
+                    elif _renew_lapsed_subscription(existing_sub):
+                        logger.info(
+                            f"💾 Renewed lapsed toast subscription: authed -> {username}"
                         )
 
                 # Handle subscribedOn: THEY subscribed TO you
@@ -1065,9 +1078,9 @@ class WebSocketActionHandler:
                         logger.info(
                             f"💾 Saved toast subscription: {username} ({subscriber_id}) -> authed (performer) {authed_id}"
                         )
-                    else:
-                        logger.debug(
-                            f"Subscription already exists: {username} -> authed"
+                    elif _renew_lapsed_subscription(existing_sub):
+                        logger.info(
+                            f"💾 Renewed lapsed toast subscription: {username} -> authed"
                         )
 
                 session.commit()
