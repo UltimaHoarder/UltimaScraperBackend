@@ -33,6 +33,7 @@ from ...usapi_initializer import (
 )
 from ..dependencies import get_backend_manager, get_config
 from ._auth_event_utils import publish_auth_updated
+from .orders import _spendable_balance
 
 logger = logging.getLogger(__name__)
 
@@ -579,6 +580,11 @@ async def get_auth_balance(
 
         if balance is None and hasattr(auth, "user"):
             balance = _extract_balance(getattr(auth, "user"))
+
+        if balance is not None:
+            balance = await _spendable_balance(
+                site=site_lower, authed=auth, auth_id=int(auth.id), balance=balance
+            )
 
         return AuthBalanceResponse(success=True, balance=balance)
 

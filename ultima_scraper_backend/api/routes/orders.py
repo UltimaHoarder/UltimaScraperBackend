@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, cast
 from uuid import uuid4
@@ -20,6 +22,7 @@ from ultima_scraper_api import (
     user_types,
 )
 
+from ultima_scraper_api.apis.onlyfans.urls import APIRoutes
 from ultima_scraper_db_archive import (
     UserAuthModel,
     UserInfoModel,
@@ -138,6 +141,53 @@ async def _refresh_spender_balance_after_purchase(
             exc_info=True,
         )
     return _extract_balance(refreshed_user)
+
+
+def _wallet_tax_percent(payment_methods: object) -> float | None:
+    if not isinstance(payment_methods, dict):
+        return None
+    methods = cast(dict[str, Any], payment_methods)
+    for method in methods.get("cards") or []:
+        if isinstance(method, dict) and method.get("isInternal"):
+            return sum(
+                float(method.get(key) or 0)
+                for key in ("vatPercent", "taxPercent", "mediaTaxPercent")
+            )
+    return None
+
+
+async def _refresh_spender_tax(
+    *,
+    site: str,
+    authed: auth_types,
+    auth_id: int,
+) -> float | None:
+    """Fetch and store the tax the site adds to this spender's wallet payments."""
+    site_name = _normalise_site(site)
+    if site_name != "onlyfans":
+        return None
+
+    requester: Any = cast(Any, authed).get_requester()
+    if inspect.isawaitable(requester):
+        requester = await requester
+    # It's the buyer's tax, so any price and performer give the same percent.
+    tax_percent = _wallet_tax_percent(
+        await requester.json_request(
+            APIRoutes().payment_methods_vat("subscribe", 10, auth_id)
+        )
+    )
+    if tax_percent is None:
+        return None
+
+    site_db = MultiSiteDatabaseManager().get_or_create_manager(site_name)
+    if site_db:
+        with site_db.get_session() as session:
+            user = session.get(UserModel, auth_id)
+            if user is not None:
+                user.wallet_tax_percent = tax_percent
+                session.add(user)
+                session.commit()
+    return tax_percent
 
 
 class OrderedPerformerCreateRequest(BaseModel):
@@ -282,8 +332,54 @@ def _extract_balance(user: object) -> float | None:
     return None
 
 
+def _after_tax(balance: float, tax_percent: float | None) -> float:
+    """The highest price this balance can pay, as tax comes from it too."""
+    if not tax_percent:
+        return balance
+    return math.floor(balance / (1 + tax_percent / 100) * 100) / 100
+
+
+def _get_stored_tax_percents(
+    site_name: str, auth_ids: set[int]
+) -> dict[int, float | None]:
+    try:
+        site_db = MultiSiteDatabaseManager().get_or_create_manager(site_name)
+        if not site_db:
+            return {}
+
+        with site_db.get_session() as session:
+            rows = session.exec(
+                sql_select(UserModel.id, UserModel.wallet_tax_percent).where(
+                    UserModel.id.in_(list(auth_ids))  # type: ignore[attr-defined]
+                )
+            ).all()
+            return {int(user_id): percent for user_id, percent in rows}
+    except Exception:
+        return {}
+
+
+async def _spendable_balance(
+    *,
+    site: str,
+    authed: auth_types,
+    auth_id: int,
+    balance: float,
+) -> float:
+    tax_percent = _get_stored_tax_percents(site, {auth_id}).get(auth_id)
+    if tax_percent is None:
+        try:
+            tax_percent = await _refresh_spender_tax(
+                site=site, authed=authed, auth_id=auth_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read spender %s tax on %s: %s", auth_id, site, exc
+            )
+    return _after_tax(balance, tax_percent)
+
+
 def _get_stored_user_balances(site_name: str, auth_ids: set[int]) -> dict[int, float]:
-    """Return balances from site DB for many spender auth IDs in one query."""
+    """Return what many spender auth IDs can spend after tax, in one query."""
     if not auth_ids:
         return {}
     try:
@@ -293,16 +389,18 @@ def _get_stored_user_balances(site_name: str, auth_ids: set[int]) -> dict[int, f
             return {}
 
         with site_db.get_session() as session:
-            rows: list[tuple[int, float | None]] = list(
+            rows: list[tuple[int, float | None, float | None]] = list(
                 session.exec(
-                    sql_select(UserModel.id, UserModel.balance).where(
+                    sql_select(
+                        UserModel.id, UserModel.balance, UserModel.wallet_tax_percent
+                    ).where(
                         UserModel.id.in_(list(auth_ids))  # type: ignore[attr-defined]
                     )
                 ).all()
             )
             return {
-                int(user_id): float(balance) if balance is not None else 0.0
-                for user_id, balance in rows
+                int(user_id): _after_tax(float(balance or 0.0), tax_percent)
+                for user_id, balance, tax_percent in rows
             }
     except Exception:
         return {}
@@ -1006,6 +1104,9 @@ async def _select_spender(
             continue
         user = await cast(Callable[[], Awaitable[object]], get_authed_user)()
         balance = _extract_balance(user)
+        if balance is not None:
+            tax_percent = _get_stored_tax_percents(site, {auth_id}).get(auth_id)
+            balance = _after_tax(balance, tax_percent)
 
         # Check if spender has sufficient balance for paid items
         if price is not None and price > 0:
@@ -1052,6 +1153,7 @@ async def _get_cached_authed_session(
             await _refresh_spender_balance_after_purchase(
                 site=site, authed=authed, auth_id=auth_id
             )
+            await _refresh_spender_tax(site=site, authed=authed, auth_id=auth_id)
         except Exception as exc:
             logger.warning(
                 "Could not refresh spender %s balance on %s: %s", auth_id, site, exc
@@ -2010,6 +2112,7 @@ async def _refresh_spender_balances(site: str, backend_manager: BackendManager) 
                 await _refresh_spender_balance_after_purchase(
                     site=site, authed=authed, auth_id=auth_id
                 )
+                await _refresh_spender_tax(site=site, authed=authed, auth_id=auth_id)
         except Exception as exc:
             logger.warning(
                 "Could not refresh spender %s balance on %s: %s", auth_id, site, exc
@@ -2425,6 +2528,14 @@ async def execute_order(
                 paid_candidates = _get_candidate_auth_ids(
                     site.name, price=1.0
                 )  # Any >0 price
+                # Signing each spender in stores its current balance and tax.
+                for auth_id, _ in free_candidates + paid_candidates:
+                    await _get_cached_authed_session(
+                        site=site.name,
+                        auth_id=auth_id,
+                        backend_manager=backend_manager,
+                        auth_cache=auth_session_cache,
+                    )
                 stored_balances = _get_stored_user_balances(
                     site.name,
                     {auth_id for auth_id, _ in free_candidates + paid_candidates},
