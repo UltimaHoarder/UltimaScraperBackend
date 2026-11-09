@@ -605,20 +605,42 @@ class ExecutionTelemetry:
         return result
 
 
-def _transient(exc):
-    import aiohttp
-
+def _exception_chain(exc):
     visited = set()
     while exc is not None and id(exc) not in visited:
         visited.add(id(exc))
-        # The next attempt uses a fresh transaction and the existing bounded
-        # SQL retry schedule, ownership fence, and logical mutation identity.
-        if database_unavailable(exc) or isinstance(
-            exc, (TimeoutError, ConnectionError, aiohttp.ClientConnectionError)
-        ):
-            return True
+        yield exc
         exc = exc.__cause__
-    return False
+
+
+def caused_by_database_outage(exc):
+    return any(database_unavailable(error) for error in _exception_chain(exc))
+
+
+def _transient(exc):
+    import aiohttp
+
+    # The next attempt uses a fresh transaction and the existing bounded
+    # SQL retry schedule, ownership fence, and logical mutation identity.
+    return caused_by_database_outage(exc) or any(
+        isinstance(error, (TimeoutError, ConnectionError, aiohttp.ClientConnectionError))
+        for error in _exception_chain(exc)
+    )
+
+
+async def _through_database_outage(operation, call):
+    """Wait out an outage on fresh connections; SQL still fences a lost attempt."""
+    recovery = _ServiceRetry(operation)
+    while True:
+        try:
+            result = await call()
+        except OperationalError as exc:
+            if not database_unavailable(exc):
+                raise
+            await recovery.failed(exc)
+        else:
+            recovery.succeeded()
+            return result
 
 
 async def execute(
@@ -765,21 +787,12 @@ async def execute(
         return result
 
     async def heartbeat():
-        recovery = _ServiceRetry("attempt renewal")
         while True:
             await asyncio.sleep(max(0.1, ledger.limits.lease_seconds / 3))
-            while True:
-                try:
-                    await metrics.database_call(ledger.renew, claim, phase="renew")
-                except OperationalError as exc:
-                    if not database_unavailable(exc):
-                        raise
-                    # Retry on a fresh connection. SQL still checks the owner,
-                    # token and database clock; an expired lease is never revived.
-                    await recovery.failed(exc)
-                else:
-                    recovery.succeeded()
-                    break
+            await _through_database_outage(
+                "attempt renewal",
+                lambda: metrics.database_call(ledger.renew, claim, phase="renew"),
+            )
 
     handler = asyncio.create_task(run_handler())
     keeper = asyncio.create_task(heartbeat())
@@ -796,6 +809,8 @@ async def execute(
             raise StaleAttempt("Task stopped before completing its attempt") from None
         except Exception as exc:  # noqa: BLE001 - persist handler/setup failures as attempt evidence
             retry = _transient(exc)
+            if caused_by_database_outage(exc):
+                task.forgive_database_outage()
             if task.result is None:
                 task.result = TaskResult(
                     success=False, message=str(exc), errors=[str(exc)]
@@ -803,29 +818,31 @@ async def execute(
             task.state = TaskState.FAILED
             task.completed_at = task.result.completed_at
             if PROFILE_COMPLETION_KEY in claim.task:
-                recovered = await metrics.database_call(
-                    ledger.profile_completion, claim, task=task, phase="writer_completion_recovery"
+                recovered = await _through_database_outage(
+                    "attempt completion recovery",
+                    lambda: metrics.database_call(
+                        ledger.profile_completion, claim, task=task, phase="writer_completion_recovery"
+                    ),
                 )
                 if recovered is not None:
                     task.result, task.state = recovered, TaskState.COMPLETED
                     task.completed_at = task.updated_at = recovered.completed_at
                     retry = False
         finish_started = time.monotonic()
-        await batcher.submit(
-            "finish",
-            completion_request(
-                ledger,
-                claim,
-                task,
-                retry=retry,
-                timings={
-                    "execution_ms": (time.monotonic() - started) * 1000,
-                    "claim_wait_ms": claim_wait_ms,
-                    **metrics.snapshot(timed_writer),
-                },
-            ),
-            metrics=metrics,
-            phase="finish",
+        request = completion_request(
+            ledger,
+            claim,
+            task,
+            retry=retry,
+            timings={
+                "execution_ms": (time.monotonic() - started) * 1000,
+                "claim_wait_ms": claim_wait_ms,
+                **metrics.snapshot(timed_writer),
+            },
+        )
+        await _through_database_outage(
+            "attempt completion",
+            lambda: batcher.submit("finish", request, metrics=metrics, phase="finish"),
         )
         metrics.post_ms = (time.monotonic() - finish_started) * 1000
         committed = True
@@ -1025,15 +1042,24 @@ async def service(backend):
 
     async def recovery():
         retry = _ServiceRetry("recovery")
+        last_outage = None
         while True:
             await coordination.wait()
             try:
-                await run_database_call(ledger.recover_expired)
+                # Workers cannot renew during an outage, so leases that ran
+                # out around one say nothing about the task.
+                await run_database_call(
+                    ledger.recover_expired,
+                    database_outage=last_outage is not None
+                    and time.monotonic() - last_outage <= ledger.limits.lease_seconds,
+                )
                 retry.succeeded()
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                if database_unavailable(error):
+                    last_outage = time.monotonic()
                 await retry.failed(error)
 
     async def archiver():

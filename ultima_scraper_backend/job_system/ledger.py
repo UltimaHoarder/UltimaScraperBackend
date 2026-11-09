@@ -1397,7 +1397,7 @@ class ExecutionLedger:
                 claim.task.get(PROFILE_COMPLETION_KEY),
             )
 
-    def recover_expired(self) -> int:
+    def recover_expired(self, *, database_outage: bool = False) -> int:
         recovered = 0
         with self.session_factory() as session:
             now = _now(session)
@@ -1456,6 +1456,13 @@ class ExecutionLedger:
                 )
                 work.owner = work.token = None
                 work.lease_until = None
+                if database_outage and completed is None:
+                    task.forgive_database_outage()
+                    payload.update(
+                        max_attempts=task.max_attempts,
+                        database_outage_retries=task.database_outage_retries,
+                    )
+                    work.payload_json = _dump(payload)
                 if completed is not None:
                     task.result, task.state = completed, TaskState.COMPLETED
                     task.completed_at = task.updated_at = completed.completed_at

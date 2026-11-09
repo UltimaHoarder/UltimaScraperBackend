@@ -2522,6 +2522,10 @@ async def scrape_task_handler(task: Task, context: TaskRunContext) -> TaskResult
             raise
 
     except Exception as exc:
+        from ...ledger_runtime import caused_by_database_outage
+
+        if caused_by_database_outage(exc):
+            raise  # A failed result would never be retried.
         worker_id = context.worker_id or "unknown"
         logger.exception(f"[{worker_id}] [scrape_handler] Scrape task failed: {exc}")
         return TaskResult(

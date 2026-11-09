@@ -78,6 +78,8 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat()
 
 
+MAX_DATABASE_OUTAGE_RETRIES = 10
+
 _TASK_PAYLOAD_COMPATIBILITY_KEYS = frozenset(
     {"dedupe_override", "template_content_type", "template_task"}
 )
@@ -318,9 +320,16 @@ class Task:
     result: Optional[TaskResult] = None
     attempts: int = 0
     max_attempts: int = 3
+    database_outage_retries: int = 0
     # Hierarchical structure
     parent_task_id: Optional[str] = None  # Set if this is a subtask
     subtasks: list["Task"] = field(default_factory=_empty_task_list)  # Child tasks
+
+    def forgive_database_outage(self) -> None:
+        """Give back the try an outage took, up to a limit in case this task caused it."""
+        if self.database_outage_retries < MAX_DATABASE_OUTAGE_RETRIES:
+            self.database_outage_retries += 1
+            self.max_attempts += 1
 
     @property
     def dedup_key(self) -> str:
@@ -403,6 +412,7 @@ class Task:
             "depends_on": self.depends_on,
             "attempts": self.attempts,
             "max_attempts": self.max_attempts,
+            **({"database_outage_retries": self.database_outage_retries} if self.database_outage_retries else {}),
             "result": self.result.to_dict() if include_result and self.result else None,
             "parent_task_id": self.parent_task_id,
             "subtasks": [st.to_dict(include_result=include_result) for st in self.subtasks],
@@ -454,6 +464,7 @@ class Task:
             depends_on=list(data.get("depends_on") or []),
             attempts=data.get("attempts", 0),
             max_attempts=data.get("max_attempts", 3),
+            database_outage_retries=data.get("database_outage_retries", 0),
             result=result,
             parent_task_id=data.get("parent_task_id"),
             subtasks=subtasks,
