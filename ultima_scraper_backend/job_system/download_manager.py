@@ -142,7 +142,7 @@ class DownloadItem:
             filepath = self.get_filepath()
             if "0i9c6ur7qolhf673em5ap" in str(filepath):
                 pass
-            current_filepath_exists = filepath.exists()
+            current_filepath_exists = file_has_content(filepath)
             if self.media_metadata and self.media_metadata.drm_media:
                 # For DRM media, check if the final merged file exists
                 mpd_filename = self.media_metadata.drm_media.manifest_url.split("/")[-1]
@@ -443,6 +443,14 @@ def _staging_free_bytes(path: Path) -> int:
         if available is not None:
             free = min(free, available)
     return free
+
+
+def file_has_content(path: Path) -> bool:
+    """Whether a finished file is at *path*; an interrupted move can leave 0 bytes."""
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _move_file_sync(src: Path, dest: Path) -> None:
@@ -1451,7 +1459,7 @@ class DownloadManager:
 
         try:
             # Check if file already exists
-            if dest_path.exists():
+            if file_has_content(dest_path):
                 existing_size = dest_path.stat().st_size
                 known_size = item.size
                 if known_size is None and not (

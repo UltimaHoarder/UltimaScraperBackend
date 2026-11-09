@@ -40,7 +40,12 @@ from ultima_scraper_backend.ultima_control.redis_service import (
 from ultima_scraper_backend.redis_events import JsonValue, publish_ws_event
 
 from ....database.write_queue import DatabaseWriteOperation, stable_command_id
-from ...download_manager import DownloadItem, DownloadManager, _build_temp_merge_path
+from ...download_manager import (
+    DownloadItem,
+    DownloadManager,
+    _build_temp_merge_path,
+    file_has_content,
+)
 from ...metadata_models import ContentMetadata
 from ...models import (
     Task,
@@ -1343,7 +1348,7 @@ class _DRMPipeline:
         only_drm: OnlyDRM | None = getattr(authed, "drm", None)
 
         dest_path = item.get_filepath()
-        if dest_path.exists():
+        if file_has_content(dest_path):
             logger.info(f"[DRM] Final file already exists: {dest_path}")
             return True
 
@@ -1645,7 +1650,7 @@ async def _process_download_result(
         logger.warning(f"Failed to stat download result {filepath}: {exc}")
         stat_result = None
 
-    if stat_result is not None:
+    if stat_result is not None and stat_result.st_size > 0:
         size = stat_result.st_size
         expected_size = item.size
 
@@ -1956,7 +1961,7 @@ async def _handle_profile_download(
         if not item.url or not item.filename or not item.directory:
             continue
         filepath = item.directory / item.filename
-        if filepath.exists():
+        if file_has_content(filepath):
             existing = DownloadResultItem(
                 media_id=item.media_id or 0,
                 content_id=item.content_id,
@@ -1988,7 +1993,7 @@ async def _handle_profile_download(
                 continue
             filepath = item.directory / item.filename
 
-            if filepath.exists():
+            if file_has_content(filepath):
                 file_bytes = filepath.stat().st_size
                 bytes_written += file_bytes
                 download_results.append(
