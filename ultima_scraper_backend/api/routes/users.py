@@ -2265,6 +2265,10 @@ async def list_users(
                     for user, info in results:
                         latest_media = latest_media_by_user_id.get(user.id)
                         is_subscribed = user.id in subscribed_user_ids
+                        # Older downloads only recorded the date on user_infos.
+                        downloaded_at = user.downloaded_at or (
+                            info.downloaded_at if info else None
+                        )
 
                         user_data = DatabaseUserInfo(
                             id=user.id,
@@ -2297,9 +2301,7 @@ async def list_users(
                             is_pending_order=user.id in pending_order_user_ids,
                             site=site_name,
                             downloaded_at=(
-                                user.downloaded_at.isoformat()
-                                if user.downloaded_at
-                                else None
+                                downloaded_at.isoformat() if downloaded_at else None
                             ),
                             last_checked_at=(
                                 user.last_checked_at.isoformat()
