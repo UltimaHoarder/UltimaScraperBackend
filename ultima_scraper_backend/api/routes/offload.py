@@ -65,6 +65,8 @@ class DestinationResponse(BaseModel):
     performer_username: str
     requires_full_directory_render: bool
     site_name: str
+    kept_root: str | None = None
+    kept_relative_path: str | None = None
 
 
 @router.post("/destination", response_model=DestinationResponse)
@@ -92,6 +94,10 @@ async def destination(request: DestinationRequest, caller: str = Depends(require
         performer_username=selection.performer_username,
         requires_full_directory_render=selection.requires_full_directory_render,
         site_name=selection.site_name,
+        kept_root=str(selection.kept_root) if selection.kept_root else None,
+        kept_relative_path=(
+            selection.kept_relative_path.as_posix() if selection.kept_relative_path else None
+        ),
     )
 
 

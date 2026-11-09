@@ -12,10 +12,10 @@ import re
 import stat
 import shutil
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
-from typing import Iterable, Literal, Mapping, Tuple
+from typing import Callable, Iterable, Literal, Mapping, Tuple
 
 from ultima_scraper_backend.config import (
     DownloadPathSetup,
@@ -79,10 +79,32 @@ class UserDirectorySelection:
     performer_username: str = ""
     requires_full_directory_render: bool = False
     site_name: str = ""
+    # The performer's folder under a find-only alias: read for finished files only.
+    kept_root: Path | None = None
+    kept_relative_path: Path | None = None
+    kept_site_name: str = ""
 
     @cached_property
     def absolute_path(self) -> Path:
         return (self.root / self.performer_relative_path).resolve()
+
+    def kept_directory_for(self, directory: Path, base: Path) -> Path | None:
+        """Where ``directory``, under the download ``base``, sits in the find-only folder."""
+        if (
+            self.kept_root is None
+            or self.kept_relative_path is None
+            or not directory.is_relative_to(base)
+        ):
+            return None
+        relative = directory.relative_to(base)
+        if self.requires_full_directory_render:
+            return self.kept_root / Path(
+                *(
+                    self.kept_site_name if part == self.site_name else part
+                    for part in relative.parts
+                )
+            )
+        return self.kept_root / self.kept_relative_path / relative
 
 
 @dataclass(frozen=True)
@@ -500,21 +522,47 @@ def _select_user_destination_from_setup(
     ignore_space_requirements: bool = False,
 ) -> UserDirectorySelection:
     normalized_usernames = _normalize_usernames(user_id, usernames)
-    existing = _find_existing_user_directory(
-        drive_directories=drive_directories,
-        directory_formats=[setup.directory_format, *setup.alt_directory_formats],
-        site_name=site_name,
-        usernames=normalized_usernames,
-        user_id=user_id,
-        site_aliases=setup.get_site_directory_aliases(site_name),
+    find_only = {
+        name.casefold() for name in setup.get_find_only_site_directories(site_name)
+    }
+
+    def in_find_only(relative: Path) -> bool:
+        return any(part.casefold() in find_only for part in relative.parts)
+
+    listings: dict[Path, list[str]] = {}
+
+    def find(accepts: Callable[[Path], bool]) -> UserDirectorySelection | None:
+        return _find_existing_user_directory(
+            drive_directories=drive_directories,
+            directory_formats=[setup.directory_format, *setup.alt_directory_formats],
+            site_name=site_name,
+            usernames=normalized_usernames,
+            user_id=user_id,
+            site_aliases=setup.get_site_directory_aliases(site_name),
+            accepts=accepts,
+            listings=listings,
+        )
+
+    existing = find(lambda relative: not in_find_only(relative))
+    # Also once the new folder exists, or files not yet reached fetch again.
+    kept = find(in_find_only) if find_only else None
+    kept_fields = (
+        {
+            "kept_root": kept.root,
+            "kept_relative_path": kept.performer_relative_path,
+            "kept_site_name": kept.site_name,
+        }
+        if kept is not None
+        else {}
     )
     if existing is not None:
-        return existing
+        return replace(existing, **kept_fields)
 
     selected_username = normalized_usernames[0]
     selected_root = _select_root_by_capacity(
         drive_directories,
-        required_space=required_space,
+        # Much of a performer's selection may already be in the find-only folder.
+        required_space=0 if kept is not None else required_space,
         ignore_space_requirements=ignore_space_requirements,
     )
     if selected_root is None:
@@ -534,6 +582,7 @@ def _select_user_destination_from_setup(
             setup.directory_format
         ),
         site_name=site_name,
+        **kept_fields,
     )
 
 
@@ -545,10 +594,13 @@ def _find_existing_user_directory(
     usernames: Iterable[str],
     user_id: int | None,
     site_aliases: Iterable[str] | None = None,
+    accepts: Callable[[Path], bool] = lambda relative: True,
+    listings: dict[Path, list[str]] | None = None,
 ) -> UserDirectorySelection | None:
     # The same folders come up for every alias, format and letter case:
     # list each once per lookup, which matters on slow network drives.
-    listings: dict[Path, list[str]] = {}
+    if listings is None:
+        listings = {}
     searchable_roots = [
         _prepare_drive_root_for_scan(drive_dir.path)
         for drive_dir in drive_directories
@@ -578,7 +630,9 @@ def _find_existing_user_directory(
                     for performer_relative in performer_candidates:
                         for root in searchable_roots:
                             performer_folder = root / performer_relative
-                            if _safe_path_exists(performer_folder):
+                            if accepts(performer_relative) and _safe_path_exists(
+                                performer_folder
+                            ):
                                 return UserDirectorySelection(
                                     root=root,
                                     performer_relative_path=performer_relative,
@@ -606,7 +660,11 @@ def _find_existing_user_directory(
                         performer_relative = _find_matching_relative_path(
                             root, template_parts, tokens, listings
                         )
-                        if performer_relative is None or performer_relative in seen:
+                        if (
+                            performer_relative is None
+                            or performer_relative in seen
+                            or not accepts(performer_relative)
+                        ):
                             continue
                         seen.add(performer_relative)
                         return UserDirectorySelection(

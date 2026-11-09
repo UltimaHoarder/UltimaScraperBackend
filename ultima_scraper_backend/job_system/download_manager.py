@@ -113,6 +113,8 @@ class DownloadItem:
     failure_message: str | None = None
     # Where the backend that keeps this file put it, when that is not here.
     offloaded_path: str | None = None
+    # This file's folder under a find-only alias, read for a finished copy only.
+    kept_directory: Path | None = None
 
     def get_filepath(self) -> Path:
         """Get the full target filepath."""
@@ -1219,6 +1221,11 @@ class DownloadManager:
                     directory_hint=item.directory,
                 )
                 media_metadata.filename = item.filename
+                # The name a finished copy has is only known now.
+                if item.kept_directory is not None and file_has_content(
+                    item.kept_directory / item.filename
+                ):
+                    item.directory = item.kept_directory
 
         dest_path = item.get_filepath()
 

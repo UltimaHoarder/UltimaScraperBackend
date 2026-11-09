@@ -327,13 +327,17 @@ class GlobalXPathSetup(BaseModel):
 class DownloadPathSetup(GlobalXPathSetup):
     alt_directory_formats: list[Path] = Field(default_factory=list)
     site_directory_aliases: dict[str, list[str]] = Field(default_factory=dict)
+    # Aliases whose folders are searched for finished files but never written to.
+    find_only_site_directories: dict[str, list[str]] = Field(default_factory=dict)
     staging_directories: list[StagingDirectory] = Field(default_factory=list)
     filename_format: Path = Path()
     text_length: int = 255
     date_format: str = "%Y-%m-%d"
     overwrite_files: bool = True
 
-    @field_validator("site_directory_aliases", mode="before")
+    @field_validator(
+        "site_directory_aliases", "find_only_site_directories", mode="before"
+    )
     @classmethod
     def normalize_site_directory_aliases(cls, value: Any) -> dict[str, list[str]]:
         if not value:
@@ -380,6 +384,10 @@ class DownloadPathSetup(GlobalXPathSetup):
     def get_site_directory_aliases(self, site_name: str) -> list[str]:
         cleaned_key = str(site_name).strip().lower()
         return list(self.site_directory_aliases.get(cleaned_key, []))
+
+    def get_find_only_site_directories(self, site_name: str) -> list[str]:
+        cleaned_key = str(site_name).strip().lower()
+        return list(self.find_only_site_directories.get(cleaned_key, []))
 
     @field_validator("alt_directory_formats", mode="before")
     @classmethod

@@ -134,6 +134,9 @@ class OffloadClient:
         query = {"root": root, "path": path}
         return await self._upload(local, "files", query, {**query, "mtime": local.stat().st_mtime})
 
+    async def file_state(self, *, root: str, path: str) -> dict[str, Any]:
+        return await self._call("GET", "files", params={"root": root, "path": path})
+
     async def capacity(self) -> dict[str, Any]:
         return await self._call("GET", "capacity")
 

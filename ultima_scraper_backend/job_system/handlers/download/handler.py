@@ -57,7 +57,7 @@ from ...payloads import DownloadTaskPayload
 from ..scrape.events import publish_hook_event
 from ....offload import placement
 from ....offload.client import OffloadError
-from .results import categorize_media_items, resolve_content_id
+from .results import categorize_media_items, resolve_content_id, use_kept_copies
 from .types import MediaEntry
 from .utils import (
     ensure_config,
@@ -382,6 +382,8 @@ async def _download_content_batch(
         render_full_directory_format=destination_selection.requires_full_directory_render,
         download_setup=config.settings.download_setup,
     )
+
+    use_kept_copies(download_items, destination_selection, base_destination)
 
     # Categorize media items by expiry status
     valid_items, skipped_items = categorize_media_items(download_items)
@@ -1954,6 +1956,8 @@ async def _handle_profile_download(
         database_write_site=task.site_name,
         database_write_scope=task.task_id,
     )
+
+    use_kept_copies(download_items, destination_selection, base_destination)
 
     # Filter out items that already exist
     items_to_download: list[DownloadItem] = []

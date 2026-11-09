@@ -33,6 +33,9 @@ class RemoteStore:
     owner_root: str
     local_root: Path
     selection: UserDirectorySelection
+    # The performer's find-only folder on the owner, which is never written to.
+    kept_root: str | None = None
+    kept_relative_path: str | None = None
 
     def holds(self, local_path: str | Path) -> bool:
         return Path(local_path).is_relative_to(self.local_root)
@@ -41,10 +44,28 @@ class RemoteStore:
         """Hand a finished file to the owner; returns its path there."""
         local = Path(local_path)
         relative = local.relative_to(self.local_root).as_posix()
-        committed = await self.client.store(local, root=self.owner_root, path=relative)
+        kept_path = await self._kept_copy(local)
+        if kept_path is None:
+            committed = await self.client.store(local, root=self.owner_root, path=relative)
+            kept_path = str(committed["path"])
         await asyncio.to_thread(local.unlink, missing_ok=True)
         await asyncio.to_thread(_prune_empty, local.parent, self.local_root)
-        return str(committed["path"])
+        return kept_path
+
+    async def _kept_copy(self, local: Path) -> str | None:
+        """The owner's path to this same file in the find-only folder, if it has one."""
+        performer_folder = self.local_root / self.selection.performer_relative_path
+        if (
+            self.kept_root is None
+            or self.kept_relative_path is None
+            or not local.is_relative_to(performer_folder)
+        ):
+            return None
+        path = f"{self.kept_relative_path}/{local.relative_to(performer_folder).as_posix()}"
+        state = await self.client.file_state(root=self.kept_root, path=path)
+        if state.get("exists") and state.get("size") == local.stat().st_size:
+            return f"{self.kept_root}/{path}"
+        return None
 
 
 def _prune_empty(directory: Path, stop: Path) -> None:
@@ -81,7 +102,14 @@ class Offload:
                 requires_full_directory_render=bool(answer["requires_full_directory_render"]),
                 site_name=answer["site_name"],
             )
-            return RemoteStore(client=client, owner_root=owner_root, local_root=local_root, selection=selection)
+            return RemoteStore(
+                client=client,
+                owner_root=owner_root,
+                local_root=local_root,
+                selection=selection,
+                kept_root=answer.get("kept_root"),
+                kept_relative_path=answer.get("kept_relative_path"),
+            )
         raise OffloadError("No backend can keep these files: " + "; ".join(errors or ["none reachable"]))
 
 

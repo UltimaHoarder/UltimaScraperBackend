@@ -7,10 +7,12 @@ handling HTTP errors, and resolving content IDs.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from ultima_scraper_api.helpers.url_diagnostics import diagnose_url
 
-from ...download_manager import DownloadItem
+from ...download_manager import DownloadItem, file_has_content
+from ...drive_selection import UserDirectorySelection
 from ...events import DownloadFailureReason, DownloadResultItem
 from .utils import utcnow
 
@@ -32,6 +34,31 @@ def resolve_content_id(item: DownloadItem) -> int | None:
     if media_metadata is not None and media_metadata.content_metadata is not None:
         return media_metadata.content_metadata.content_id
     return None
+
+
+def use_kept_copies(
+    download_items: list[DownloadItem],
+    selection: UserDirectorySelection,
+    base_destination: Path,
+) -> None:
+    """Point items at finished files in a find-only folder, so nothing fetches them again.
+
+    A copy of the wrong size is left alone and the item downloads to its own
+    folder, since a find-only folder is never written to.
+    """
+    for item in download_items:
+        if not item.directory or not item.filename:
+            continue
+        kept = selection.kept_directory_for(item.directory, base_destination)
+        if kept is None:
+            continue
+        item.kept_directory = kept
+        copy = kept / item.filename
+        if file_has_content(item.get_filepath()) or not file_has_content(copy):
+            continue
+        is_drm = item.media_metadata is not None and item.media_metadata.drm
+        if is_drm or item.size is None or copy.stat().st_size == item.size:
+            item.directory = kept
 
 
 def categorize_media_items(
