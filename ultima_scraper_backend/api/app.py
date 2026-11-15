@@ -73,6 +73,7 @@ from .routes import (
     auths,
     chats,
     cluster,
+    consolidation,
     curl_parser,
     database_browser,
     files,
@@ -696,6 +697,7 @@ app.include_router(server_restore.router, prefix="/api/v1")
 app.include_router(media.router, prefix="/api/v1")
 app.include_router(system.router, prefix="/api/v1")
 app.include_router(cluster.router, prefix="/api/v1")
+app.include_router(consolidation.router, prefix="/api/v1")
 app.include_router(webhooks.router, prefix="/api/v1")
 app.include_router(watch.router, prefix="/api/v1")
 app.include_router(websocket.router)

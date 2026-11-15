@@ -193,6 +193,8 @@ class Drive(BaseModel):
         True  # Whether this drive is scanned for existing performer folders
     )
     overflow: bool = True  # Whether this drive may be used even when free space is below minimum_space
+    # Split performers are consolidated onto the highest-priority drive with room.
+    priority: int = 0
     directories: list[Path] = []  # List of directories on this drive
 
 
@@ -308,6 +310,7 @@ def split_drive_configs_by_mount(drives: list[Drive]) -> list[Drive]:
                     store=drive.store,
                     scan_existing=drive.scan_existing,
                     overflow=drive.overflow,
+                    priority=drive.priority,
                     directories=list(grouped_directories[mount_point]),
                 )
             )
