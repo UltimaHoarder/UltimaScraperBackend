@@ -78,11 +78,21 @@ def purge_outbox(
                     batch=batch,
                 )
             except OperationalError as exc:
+                sqlstate = getattr(exc.orig, "sqlstate", None)
+                if sqlstate == "55P03":
+                    # History retirement drops finished runs' leaves; each
+                    # DROP holds ACCESS EXCLUSIVE on the parent this scan
+                    # reads. Keep the cursor and retry on a later cycle.
+                    session.rollback()
+                    logger.info(
+                        "Outbox retention yielded to partition DDL; retrying next cycle"
+                    )
+                    return ReceiptPurgeResult(0, 0, busy=True)
                 # Bulk identity purges (job deletion, history retirement)
                 # leave dead index entries ahead of the cursor until
                 # autovacuum removes them; stepping over millions can exceed
                 # the timeout. Keep the cursor and retry on a later cycle.
-                if getattr(exc.orig, "sqlstate", None) != "57014":
+                if sqlstate != "57014":
                     raise
                 session.rollback()
                 logger.warning(
