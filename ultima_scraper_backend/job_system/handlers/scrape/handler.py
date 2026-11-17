@@ -654,8 +654,8 @@ async def _fetch_profile_socials(
     if not uses_guest_auth or site_api is None:
         return await _fetch_socials(user)
 
-    endpoint_fn = getattr(site_api, "endpoint_links", None)
-    socials_url = endpoint_fn(user_id).socials if callable(endpoint_fn) else None
+    socials_route = getattr(getattr(site_api, "api_routes", None), "socials", None)
+    socials_url = socials_route(user_id) if callable(socials_route) else None
     if not socials_url:
         return await _fetch_socials(user)
 

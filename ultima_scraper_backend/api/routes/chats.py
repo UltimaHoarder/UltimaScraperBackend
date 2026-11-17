@@ -991,11 +991,9 @@ async def _fetch_single_page_chats(
         from ultima_scraper_api.apis.onlyfans.classes.chat_model import (
             ChatModel as APIChatModel,
         )
-        from ultima_scraper_api.apis.onlyfans.classes.extras import (
-            endpoint_links,
-        )
+        from ultima_scraper_api.apis.onlyfans.urls import APIRoutes
 
-        link = endpoint_links(global_limit=limit, global_offset=offset).list_chats
+        link = APIRoutes().list_chats(limit=limit, offset=offset)
         result = await auth.auth_session.json_request(link)  # type: ignore[union-attr]
 
         result_dict = cast(dict[str, Any], result) if isinstance(result, dict) else None
@@ -1025,12 +1023,12 @@ async def _fetch_single_page_messages(
     Avoids ``user.get_messages()`` which recursively walks all pages.
     """
     try:
-        from ultima_scraper_api.apis.onlyfans.classes.extras import endpoint_links
+        from ultima_scraper_api.apis.onlyfans.urls import APIRoutes
         from ultima_scraper_api.apis.onlyfans.classes.message_model import (
             MessageModel as APIMessageModel,
         )
 
-        link = endpoint_links().list_messages(
+        link = APIRoutes().list_messages(
             user.id,
             global_limit=limit,
             global_offset=None,  # type: ignore[union-attr]
