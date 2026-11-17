@@ -21,7 +21,6 @@ from datetime import UTC, datetime, timezone
 from typing import Any, cast
 
 from ultima_scraper_api import ContentType
-from ultima_scraper_api.apis.onlyfans.classes.auth_model import OnlyFansAuthModel
 
 from ....database.write_executor import serialize_user_write_payload
 from ....database.write_queue import DatabaseWriteOperation, stable_command_id
@@ -424,6 +423,15 @@ def _user_matches_identifier(
     return normalized_username.casefold() in candidate_names
 
 
+def _accepts_keyword(function: Any, keyword: str) -> bool:
+    """Whether a site API method names ``keyword`` (a bare ``**kwargs`` does not count)."""
+    try:
+        parameter = inspect.signature(function).parameters.get(keyword)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+
+
 async def _try_get_user(
     authed: Any, identifier: int | str, *, refresh: bool = False
 ) -> Any | None:
@@ -433,24 +441,25 @@ async def _try_get_user(
     kwargs: dict[str, Any] = {}
     if refresh:
         kwargs["refresh"] = True
-    if isinstance(authed, OnlyFansAuthModel):
+    # Sites differ in which lookup options they support; pass the ones they take.
+    if _accepts_keyword(get_user, "cache"):
         # Task lookups must not accumulate users or freshness timers on the auth.
         kwargs["cache"] = False
-        if authed.guest:
-            # Only authoritative misses may contribute to invalid-user writes.
-            kwargs["strict"] = True
-            session = authed.auth_session
-            manager = getattr(session, "session_manager", None)
-            wait_for_recovery = getattr(manager, "wait_for_route_recovery", None)
-            if callable(wait_for_recovery):
-                rate_key_fn = getattr(session, "get_rate_limit_key", session.get_route_key)
-                route_key = rate_key_fn()
-                if manager.is_route_rate_limited(route_key):
-                    wait_started = time.monotonic()
-                    try:
-                        await wait_for_recovery(route_key)
-                    finally:
-                        _observe_guest_auth("route_rate_limit_wait", wait_started)
+    if getattr(authed, "guest", False) and _accepts_keyword(get_user, "strict"):
+        # Only authoritative misses may contribute to invalid-user writes.
+        kwargs["strict"] = True
+        session = authed.auth_session
+        manager = getattr(session, "session_manager", None)
+        wait_for_recovery = getattr(manager, "wait_for_route_recovery", None)
+        if callable(wait_for_recovery):
+            rate_key_fn = getattr(session, "get_rate_limit_key", session.get_route_key)
+            route_key = rate_key_fn()
+            if manager.is_route_rate_limited(route_key):
+                wait_started = time.monotonic()
+                try:
+                    await wait_for_recovery(route_key)
+                finally:
+                    _observe_guest_auth("route_rate_limit_wait", wait_started)
     try:
         result = get_user(identifier, **kwargs)
     except TypeError:
@@ -468,14 +477,15 @@ async def _resolve_user_from_chats(
     worker_id: str,
 ) -> Any | None:
     normalized_username = _normalize_username(username)
-    if isinstance(authed, OnlyFansAuthModel):
+    iter_chats = getattr(authed, "iter_chats", None)
+    if callable(iter_chats):  # site contract: iter_chats(query=, limit=)
         lookups: list[tuple[str | None, int | None]] = (
             [(normalized_username, 50)] if normalized_username else []
         )
         lookups.append((None, None))
         for query, limit in lookups:
             try:
-                async with aclosing(authed.iter_chats(query=query, limit=limit)) as chats:
+                async with aclosing(iter_chats(query=query, limit=limit)) as chats:
                     async for chat in chats:
                         if _user_matches_identifier(
                             chat.user, user_id=user_id, username=normalized_username
