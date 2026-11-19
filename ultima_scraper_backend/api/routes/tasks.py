@@ -12,6 +12,8 @@ from typing import Any, List, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from ...sites import ENABLED_SITE_KEYS, site_title
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -35,6 +37,14 @@ class TaskParameterOption(BaseModel):
 
     label: str
     value: str
+
+
+def _site_options() -> list[TaskParameterOption]:
+    """Every site jobs can run on, by display name ("OnlyFans")."""
+    return [
+        TaskParameterOption(label=site_title(site), value=site_title(site))
+        for site in ENABLED_SITE_KEYS
+    ]
 
 
 class TaskParameter(BaseModel):
@@ -79,10 +89,7 @@ TASK_DEFINITIONS: List[TaskDefinition] = [
                 required=True,
                 default="OnlyFans",
                 description="Which site to scrape from",
-                options=[
-                    TaskParameterOption(label="OnlyFans", value="OnlyFans"),
-                    TaskParameterOption(label="Fansly", value="Fansly"),
-                ],
+                options=_site_options(),
             ),
             TaskParameter(
                 name="username",
@@ -147,10 +154,7 @@ TASK_DEFINITIONS: List[TaskDefinition] = [
                 required=True,
                 default="OnlyFans",
                 description="Which site to scrape from",
-                options=[
-                    TaskParameterOption(label="OnlyFans", value="OnlyFans"),
-                    TaskParameterOption(label="Fansly", value="Fansly"),
-                ],
+                options=_site_options(),
             ),
             TaskParameter(
                 name="performer",
@@ -204,10 +208,7 @@ TASK_DEFINITIONS: List[TaskDefinition] = [
                 required=True,
                 default="OnlyFans",
                 description="Which site to download from",
-                options=[
-                    TaskParameterOption(label="OnlyFans", value="OnlyFans"),
-                    TaskParameterOption(label="Fansly", value="Fansly"),
-                ],
+                options=_site_options(),
             ),
             TaskParameter(
                 name="username",
@@ -267,10 +268,7 @@ TASK_DEFINITIONS: List[TaskDefinition] = [
                 required=True,
                 default="OnlyFans",
                 description="Which site to refresh",
-                options=[
-                    TaskParameterOption(label="OnlyFans", value="OnlyFans"),
-                    TaskParameterOption(label="Fansly", value="Fansly"),
-                ],
+                options=_site_options(),
             ),
         ],
     ),

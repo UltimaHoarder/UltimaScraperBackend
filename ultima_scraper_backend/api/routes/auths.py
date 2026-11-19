@@ -30,10 +30,12 @@ from ...services.plugin_proxies import guard_proxy_assignment
 from ...usapi_initializer import (
     AssignedProxyResolutionError,
     resolve_assigned_proxy_url,
+    site_auth_json,
 )
 from ..dependencies import get_backend_manager, get_config
 from ._auth_event_utils import publish_auth_updated
 from .orders import _spendable_balance
+from ...sites import ENABLED_SITE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,9 @@ class AuthTestResult(BaseModel):
     success: bool
     status: str
     message: str
+    # Set by a refresh (``refresh=true``) whose sign-in worked.
+    username: str | None = None
+    profile_updated: bool | None = None
 
 
 class AuthProxyTestResult(BaseModel):
@@ -326,7 +331,7 @@ def list_auths(
         all_auths: List[AuthCredential] = []
 
         # Get sites to query
-        sites_to_query = [site.lower()] if site else ["onlyfans", "fansly"]
+        sites_to_query = [site.lower()] if site else list(ENABLED_SITE_KEYS)
 
         site_totals: dict[str, int] = {}
 
@@ -787,15 +792,70 @@ async def update_auth(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+async def _refresh_stored_account(
+    site_db: Any,
+    site: str,
+    auth_id: int,
+    authed: Any,
+    backend_manager: BackendManager,
+) -> dict[str, Any]:
+    """After a working sign-in, bring the stored account up to date: the
+    archive's copy of its profile, its username, and (DarkFans, which renews
+    its hour-long JWT on sign-in) the session cookie it signed in with."""
+    from ...database.helpers.user_sync import sync_authed_user_from_api
+
+    try:
+        async with asyncio.timeout(30):
+            profile_updated = await sync_authed_user_from_api(site_db, authed, site=site)
+    except Exception as exc:  # noqa: BLE001 - the sign-in itself worked
+        logger.debug("Refreshing the %s profile for auth %s failed: %s", site, auth_id, exc)
+        profile_updated = False
+    username = getattr(authed, "username", None)
+    username = username if isinstance(username, str) and username else None
+    cookie: object = None
+    with suppress(Exception):
+        get_details = getattr(authed, "get_auth_details", None)
+        cookie = getattr(get_details() if callable(get_details) else None, "cookie", None)
+
+    changed = False
+    with site_db.get_session() as session:
+        auth = session.exec(select(UserAuthModel).where(UserAuthModel.id == auth_id)).first()
+        if auth:
+            if username and auth.username != username:
+                auth.username = username
+                changed = True
+            # Only a plain cookie string is a sign-in to keep (OnlyFans'
+            # cookie is a jar object, Fansly and Privacy have none).
+            if isinstance(cookie, str) and cookie and cookie != auth.cookie:
+                auth.cookie = cookie
+                changed = True
+            if changed:
+                auth.touch()
+                session.add(auth)
+                session.commit()
+            account_id, site_name = auth.user_id, auth.site
+    if changed:
+        # Workers holding the old sign-in pick up the new one.
+        await publish_auth_updated(
+            backend_manager, account_id, username=username, site=site_name
+        )
+    return {"username": username, "profile_updated": profile_updated}
+
+
 @router.post("/{auth_id}/test", response_model=AuthTestResult)
 async def test_auth(
     auth_id: int,
     site: str = Query(..., description="Site name"),
+    refresh: bool = Query(
+        False,
+        description="Also update the stored profile and sign-in when it works",
+    ),
     backend_manager: BackendManager = Depends(get_backend_manager),
 ) -> AuthTestResult:
-    """Test if an auth credential is still valid."""
+    """Test if an auth credential is still valid; with ``refresh``, also
+    update the stored account from the sign-in."""
     try:
-        from ultima_scraper_api.apis.fansly.fansly import FanslyAPI
+        import ultima_scraper_api
 
         db_manager = MultiSiteDatabaseManager()
         site_db = db_manager.get_or_create_manager(site.lower())
@@ -813,10 +873,8 @@ async def test_auth(
                 raise HTTPException(status_code=404, detail="Auth credential not found")
 
             proxy_id = auth.proxy_id
-            user_id = auth.user_id
-            username = auth.username
-            user_agent = auth.user_agent
-            authorization = auth.authorization
+            # What the site's API signs in with, read before the session ends.
+            stored_auth_json = site_auth_json(site, auth)
 
         # 2. Network Testing (outside of DB lock)
         try:
@@ -895,6 +953,15 @@ async def test_auth(
                         auth.touch()
                         session.add(auth)
                         session.commit()
+                if refresh:
+                    return AuthTestResult(
+                        success=True,
+                        status="valid",
+                        message="Account refreshed",
+                        **await _refresh_stored_account(
+                            site_db, site_lower, auth_id, authed, backend_manager
+                        ),
+                    )
                 return AuthTestResult(
                     success=True,
                     status="valid",
@@ -923,18 +990,12 @@ async def test_auth(
                 message=message,
             )
 
-        # Fansly still uses its existing site-specific login flow.
-
-        if site_lower == "fansly":
-            auth_json = {
-                "id": user_id,
-                "username": username or "",
-                "authorization": authorization or "",
-                "user_agent": user_agent,
-            }
+        # The other sites sign in here with the stored fields.
+        if site_lower in ENABLED_SITE_KEYS:
+            auth_json = dict(stored_auth_json)
             if proxy_url:
                 auth_json["proxy_url"] = proxy_url
-            api = FanslyAPI()
+            api = ultima_scraper_api.select_api(site_lower)
         else:
             return AuthTestResult(
                 success=False,
@@ -983,6 +1044,15 @@ async def test_auth(
                                 session.add(auth)
                                 session.commit()
 
+                        if refresh:
+                            return AuthTestResult(
+                                success=True,
+                                status="valid",
+                                message="Account refreshed",
+                                **await _refresh_stored_account(
+                                    site_db, site_lower, auth_id, authed, backend_manager
+                                ),
+                            )
                         return AuthTestResult(
                             success=True,
                             status="valid",

@@ -27,6 +27,7 @@ from ultima_scraper_db_archive import (
 from ...database.factory import MultiSiteDatabaseManager
 from ...services.profile_refresh import queue_cached_profile_refresh
 from ...services import favourites_service
+from ...sites import ENABLED_SITE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,7 @@ class SubscriptionStatsResponse(BaseModel):
 @router.get("/sites")
 async def get_subscription_sites() -> List[str]:
     """Get list of supported sites for subscriptions."""
-    return ["onlyfans", "fansly"]
+    return list(ENABLED_SITE_KEYS)
 
 
 @router.get("/", response_model=SubscriptionListResponse)
@@ -164,7 +165,7 @@ def list_subscriptions(
                 )
 
         db_manager = MultiSiteDatabaseManager()
-        sites_to_query = [site.lower()] if site else ["onlyfans", "fansly"]
+        sites_to_query = [site.lower()] if site else list(ENABLED_SITE_KEYS)
         single_site_query = len(sites_to_query) == 1
         raw_rows: list[tuple[str, Mapping[str, object]]] = []
         total_count = 0
@@ -403,7 +404,7 @@ def get_subscription_stats() -> List[SubscriptionStatsResponse]:
         db_manager = MultiSiteDatabaseManager()
         stats: List[SubscriptionStatsResponse] = []
 
-        for site_name in ["onlyfans", "fansly"]:
+        for site_name in ENABLED_SITE_KEYS:
             site_db = db_manager.get_or_create_manager(site_name)
             if not site_db:
                 continue

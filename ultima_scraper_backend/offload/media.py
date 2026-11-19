@@ -80,7 +80,11 @@ async def _decrypt(stream: Path, key: str) -> Path:
         raise MediaUnavailable("mp4decrypt is not installed on this backend")
     output = stream.with_name(f"{stream.stem}.dec.mp4")
     temporary = output.with_name(f"{output.name}.part")
-    result = await _formatter_instance().run_process([tool, str(stream), str(temporary), "--key", key])
+    from ultima_scraper_api.apis.onlyfans.classes.only_drm import mp4decrypt_key_arguments
+
+    result = await _formatter_instance().run_process(
+        [tool, str(stream), str(temporary), *mp4decrypt_key_arguments(key)]
+    )
     if result.returncode:
         temporary.unlink(missing_ok=True)
         raise RuntimeError(f"mp4decrypt failed: {result.stderr.decode(errors='replace')}")

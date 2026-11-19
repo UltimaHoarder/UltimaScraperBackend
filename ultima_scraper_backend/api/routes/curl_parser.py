@@ -211,8 +211,6 @@ def _build_auth_login_request(
     parsed: ParsedCurlData,
     proxy_url: str | None = None,
 ) -> tuple[dict[str, Any], Any | None] | tuple[None, None]:
-    from ultima_scraper_api.apis.fansly.fansly import FanslyAPI
-
     site_lower = site.lower()
     if site_lower == "onlyfans":
         auth_json: dict[str, Any] = {
@@ -226,16 +224,28 @@ def _build_auth_login_request(
             auth_json["proxy_url"] = proxy_url
         return auth_json, None
 
-    if site_lower == "fansly":
-        auth_json = {
-            "id": parsed.user_id or 0,
-            "username": "",
-            "authorization": parsed.authorization or "",
-            "user_agent": parsed.user_agent or "",
-        }
+    if site_lower in _LOCAL_LOGIN_SITES:
+        from types import SimpleNamespace
+
+        import ultima_scraper_api
+
+        from ...usapi_initializer import site_auth_json
+
+        auth_json = site_auth_json(
+            site_lower,
+            SimpleNamespace(
+                user_id=parsed.user_id or 0,
+                cookie=parsed.cookie,
+                x_bc=parsed.x_bc,
+                authorization=parsed.authorization,
+                user_agent=parsed.user_agent,
+            ),
+        )
+        if not auth_json["id"]:
+            auth_json.pop("id")
         if proxy_url:
             auth_json["proxy_url"] = proxy_url
-        return auth_json, FanslyAPI()
+        return auth_json, ultima_scraper_api.select_api(site_lower)
 
     return None, None
 
@@ -302,6 +312,9 @@ async def _test_parsed_auth(
     try:
         async with api.login_context(auth_json) as authed:
             if authed and authed.is_authed():
+                # The import stores the auth under the signed-in account.
+                if not parsed.user_id and getattr(authed, "id", None):
+                    parsed.user_id = int(authed.id)
                 if site_lower == "onlyfans" and email_notifications_enabled is not None:
                     notification_settings = getattr(
                         authed, "notification_settings", None
@@ -457,6 +470,39 @@ def parse_onlyfans_curl(curl_command: str) -> ParsedCurlData:
     )
 
 
+def parse_privacy_curl(curl_command: str) -> ParsedCurlData:
+    """Parse a Privacy cURL (any service.privacy.com.br call): its
+    ``authorization`` header is the sign-in."""
+    parsed = parse_fansly_curl(curl_command)
+    parsed.site = "privacy"
+    parsed.sess = None
+    return parsed
+
+
+def parse_darkfans_curl(curl_command: str) -> ParsedCurlData:
+    """Parse a DarkFans cURL (any darkfans.com/api call): the ``BEARER`` and
+    ``refresh_token`` cookies are the sign-in, stored together as ``cookie``."""
+    from ultima_scraper_api.apis.darkfans.darkfans import (
+        extract_auth_details_from_curl,
+    )
+
+    try:
+        details = extract_auth_details_from_curl(curl_command)
+    except ValueError as exc:
+        return ParsedCurlData(success=False, site="darkfans", error=str(exc))
+    return ParsedCurlData(
+        success=True,
+        site="darkfans",
+        cookie=details.cookie,
+        user_agent=details.user_agent or None,
+    )
+
+
+# Sites whose import signs in here, in the API process, and learns the
+# account id from that sign-in (OnlyFans signs in through a worker).
+_LOCAL_LOGIN_SITES = ("fansly", "privacy", "darkfans")
+
+
 def parse_fansly_curl(curl_command: str) -> ParsedCurlData:
     """Parse a Fansly cURL command."""
     headers: Dict[str, str] = {}
@@ -513,6 +559,14 @@ def parse_fansly_curl(curl_command: str) -> ParsedCurlData:
     )
 
 
+_CURL_PARSERS = {
+    "onlyfans": parse_onlyfans_curl,
+    "fansly": parse_fansly_curl,
+    "privacy": parse_privacy_curl,
+    "darkfans": parse_darkfans_curl,
+}
+
+
 @router.post("/parse", response_model=ParsedCurlData)
 async def parse_curl(request: CurlParseRequest) -> ParsedCurlData:
     """Parse a cURL command to extract authentication data.
@@ -523,6 +577,8 @@ async def parse_curl(request: CurlParseRequest) -> ParsedCurlData:
     Supported sites:
     - onlyfans: Extracts cookie, x-bc, authorization, user-agent, user-id
     - fansly: Extracts authorization, user-agent, session token
+    - privacy: Extracts authorization, user-agent
+    - darkfans: Extracts the BEARER and refresh_token cookies, user-agent
     """
     curl_command = request.curl_command.strip()
     site = request.site.lower()
@@ -541,15 +597,14 @@ async def parse_curl(request: CurlParseRequest) -> ParsedCurlData:
             error=CURL_INPUT_ERROR,
         )
 
-    if site == "onlyfans":
-        return parse_onlyfans_curl(curl_command)
-    if site == "fansly":
-        return parse_fansly_curl(curl_command)
+    parser = _CURL_PARSERS.get(site)
+    if parser is not None:
+        return parser(curl_command)
 
     return ParsedCurlData(
         success=False,
         site=site,
-        error=f"Unsupported site: {site}. Supported: onlyfans, fansly",
+        error=f"Unsupported site: {site}. Supported: {', '.join(_CURL_PARSERS)}",
     )
 
 
@@ -584,6 +639,13 @@ class AddAuthFromCurlRequest(BaseModel):
     input_type: str = "curl"
     proxy_id: str | None = None
     email_notifications_enabled: bool | None = None
+    # Mark the account a spender: None leaves an existing account's setting
+    # alone; spender_type is what it may buy ("all", "free" or "paid").
+    spend: bool | None = None
+    spender_type: str | None = None
+
+
+SPENDER_TYPES = ("all", "free", "paid")
 
 
 class AddAuthFromCurlResponse(BaseModel):
@@ -610,6 +672,12 @@ async def add_auth_from_curl(
     from ultima_scraper_db_archive import UserAuthModel, UserModel
 
     from ...database.factory import MultiSiteDatabaseManager
+
+    if request.spender_type is not None and request.spender_type not in SPENDER_TYPES:
+        return AddAuthFromCurlResponse(
+            success=False,
+            error=f"Unknown spender type: {request.spender_type} (use {', '.join(SPENDER_TYPES)})",
+        )
 
     input_type = request.input_type.strip().lower()
     if input_type == "json":
@@ -688,6 +756,13 @@ async def add_auth_from_curl(
                 )
                 session.add(user)
                 session.flush()
+
+            if request.spend is not None:
+                user.spend = request.spend
+                if request.spend:
+                    user.spender_type = request.spender_type or "all"
+                user.touch()
+                session.add(user)
 
             # Check if auth already exists
             existing_auth = session.exec(

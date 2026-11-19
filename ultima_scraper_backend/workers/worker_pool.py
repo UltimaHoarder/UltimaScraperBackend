@@ -983,7 +983,11 @@ class Worker:
             self.ultima_scraper_api = ultima_scraper_api.UltimaScraperAPI(usapi_config)
 
             # Initialize (guest login) for supported sites only
-            await self.ultima_scraper_api.init(ignore_sites=["Fansly", "LoyalFans"])
+            # Only OnlyFans scrapes without a signed-in account; the other
+            # sites' jobs run with the account named on the task.
+            await self.ultima_scraper_api.init(
+                ignore_sites=["Fansly", "LoyalFans", "Privacy", "DarkFans"]
+            )
 
             # Store API instances from the centralized manager
             for site in self.supported_sites:
@@ -2052,6 +2056,7 @@ class Worker:
                         AssignedProxyResolutionError,
                         USAPIInitializer,
                         resolve_assigned_proxy_url,
+                        site_auth_json,
                     )
 
                     # Get the database manager for this site
@@ -2068,13 +2073,7 @@ class Worker:
                     account = db_manager.get_user_auth(account_id_int)
 
                     if account:
-                        auth_json = {
-                            "id": account.user_id,
-                            "username": account.username or "",
-                            "cookie": account.cookie or "",
-                            "x_bc": account.x_bc or "",
-                            "user_agent": account.user_agent or "",
-                        }
+                        auth_json = site_auth_json(site, account)
                         try:
                             proxy_url = resolve_assigned_proxy_url(account.proxy_id)
                         except AssignedProxyResolutionError as exc:
@@ -2086,13 +2085,17 @@ class Worker:
                         if proxy_url:
                             auth_json["proxy_url"] = proxy_url
                     else:
-                        auth_json = {
-                            "id": account_id_int,
-                            "username": username,
-                            "cookie": getattr(existing_auth, "cookie", ""),
-                            "x_bc": getattr(existing_auth, "x_bc", ""),
-                            "user_agent": getattr(existing_auth, "user_agent", ""),
+                        # No stored row: reuse what the loaded auth signed in with.
+                        details = getattr(existing_auth, "get_auth_details", lambda: None)()
+                        stored = {
+                            field: value
+                            for field in ("cookie", "x_bc", "authorization", "user_agent", "email")
+                            if isinstance(value := getattr(details, field, ""), str)
                         }
+                        auth_json = site_auth_json(
+                            site,
+                            SimpleNamespace(user_id=account_id_int, username=username, **stored),
+                        )
 
                     # Re-initialize (skip API refresh since we just saved to DB)
                     reloaded_auth = await initializer.initialize_auth(

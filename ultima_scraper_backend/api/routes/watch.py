@@ -20,6 +20,7 @@ from ...models.backend import BackendInstance
 from ...redis.keys import WATCHES_PAUSED_KEY
 from ...database.factory import MultiSiteDatabaseManager
 from ..dependencies import get_backend_instance
+from ...sites import ENABLED_SITE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ async def get_watch_list(
     users: list[WatchedUserInfo] = []
     total = 0
 
-    sites_to_query = [site.lower()] if site else ["onlyfans", "fansly"]
+    sites_to_query = [site.lower()] if site else list(ENABLED_SITE_KEYS)
 
     for site_name in sites_to_query:
         site_db = db_manager.get_or_create_manager(site_name)
@@ -140,7 +141,7 @@ async def get_watch_stats(
     by_site: dict[str, int] = {}
     total = 0
 
-    for site_name in ("onlyfans", "fansly"):
+    for site_name in ENABLED_SITE_KEYS:
         site_db = db_manager.get_or_create_manager(site_name)
         if not site_db:
             by_site[site_name] = 0

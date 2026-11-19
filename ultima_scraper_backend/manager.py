@@ -1460,9 +1460,7 @@ class BackendManager(ContentPersistenceMixin):
         """
         Construct a site-specific auth_json payload expected by ultima_scraper_api.
 
-        Different sites require different authentication fields:
-        - OnlyFans/LoyalFans: cookie, x_bc
-        - Fansly: authorization (NOT cookie/x_bc)
+        Each site reads its own fields (see ``usapi_initializer.site_auth_json``).
         """
 
         account_identifier = account.user_id or account.id
@@ -1471,32 +1469,13 @@ class BackendManager(ContentPersistenceMixin):
 
         site_key = (site or account.site or "").lower()
 
-        # Base fields common to all sites
-        payload: dict[str, Any] = {
-            "id": account_identifier,
-            "username": account.username or "",
-            "user_agent": account.user_agent or "",
-            "email": account.email or "",
-            "password": account.password or "",
-        }
-
-        # Add site-specific authentication fields
-        if site_key == "onlyfans" or site_key == "loyalfans":
-            # OnlyFans and LoyalFans use cookie + x_bc
-            payload["cookie"] = account.cookie or ""
-            payload["x_bc"] = account.x_bc or ""
-        elif site_key == "fansly":
-            # Fansly uses authorization token
-            payload["authorization"] = account.authorization or ""
-        else:
-            # Default to OnlyFans-style for unknown sites
-            payload["cookie"] = account.cookie or ""
-            payload["x_bc"] = account.x_bc or ""
-
         from ultima_scraper_backend.usapi_initializer import (
             apply_assigned_proxy_to_auth_json,
+            site_auth_json,
         )
 
+        payload = site_auth_json(site_key, account)
+        payload["id"] = account_identifier
         return apply_assigned_proxy_to_auth_json(payload, account.proxy_id)
 
     @staticmethod

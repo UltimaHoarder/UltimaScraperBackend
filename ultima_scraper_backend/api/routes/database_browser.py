@@ -48,6 +48,7 @@ from ultima_scraper_db_archive import (
 from ...database.factory import MultiSiteDatabaseManager
 from ...database.threads import run_database_call
 from ...helpers.background_tasks import spawn_background_task
+from ...sites import ENABLED_SITE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -692,7 +693,7 @@ class ArchivePurchaseFactsResponse(BaseModel):
 def _parse_archive_metrics_cursor(
     site: str | None, cursor: str | None
 ) -> tuple[str, int]:
-    supported_sites = ("onlyfans", "fansly")
+    supported_sites = ENABLED_SITE_KEYS
     resolved_site = site.lower() if site else supported_sites[0]
     if resolved_site not in supported_sites:
         raise ValueError("Unsupported site")
@@ -797,7 +798,7 @@ def get_database_stats() -> List[DatabaseStats]:
         db_manager = MultiSiteDatabaseManager()
         stats: List[DatabaseStats] = []
 
-        for site_name in ["onlyfans", "fansly"]:
+        for site_name in ENABLED_SITE_KEYS:
             site_db = db_manager.get_or_create_manager(site_name)
             if not site_db:
                 continue
@@ -884,7 +885,7 @@ def archive_metrics(
     ingestion resumable.
     """
 
-    supported_sites = ("onlyfans", "fansly")
+    supported_sites = ENABLED_SITE_KEYS
     try:
         start_site, start_user_id = _parse_archive_metrics_cursor(site, cursor)
     except ValueError as exc:
@@ -1235,7 +1236,7 @@ def archive_purchase_facts(
     """Continue generic acquisition facts for one purchase-heavy performer."""
 
     site_name = site.lower()
-    if site_name not in {"onlyfans", "fansly"}:
+    if site_name not in ENABLED_SITE_KEYS:
         raise HTTPException(status_code=422, detail="Unsupported site")
     site_db = MultiSiteDatabaseManager().get_or_create_manager(site_name)
     if not site_db:
@@ -1322,7 +1323,7 @@ def browse_users(
         all_users: List[UserBrowserItem] = []
 
         site_str = str(site).lower() if site and isinstance(site, str) else None
-        sites_to_query = [site_str] if site_str else ["onlyfans", "fansly"]
+        sites_to_query = [site_str] if site_str else list(ENABLED_SITE_KEYS)
         single_site = len(sites_to_query) == 1
         total = 0
 
@@ -1833,7 +1834,7 @@ def browse_all_content(
         from sqlmodel import func
 
         db_manager = MultiSiteDatabaseManager()
-        sites_to_query = [site.lower()] if site else ["onlyfans", "fansly"]
+        sites_to_query = [site.lower()] if site else list(ENABLED_SITE_KEYS)
         single_site_query = len(sites_to_query) == 1
         types_to_query = (
             [content_type.lower()]
@@ -2539,7 +2540,7 @@ def browse_media(
             name = url.split("/")[-1].split("?")[0].strip()
             return name or None
 
-        sites_to_query = [site.lower()] if site else ["onlyfans", "fansly"]
+        sites_to_query = [site.lower()] if site else list(ENABLED_SITE_KEYS)
         offset = (page - 1) * page_size
 
         for site_name in sites_to_query:

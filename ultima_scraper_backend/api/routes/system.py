@@ -44,6 +44,7 @@ from .setup import (
     _configured_redis_request,
     get_backend_startup_id,
 )
+from ...sites import SUPPORTED_SITE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -1960,7 +1961,7 @@ def _get_available_database_sites(
             logger.debug("Failed to discover database schemas: %s", exc)
 
     if not sites:
-        sites = ["management", "onlyfans", "fansly"]
+        sites = ["management", *SUPPORTED_SITE_KEYS]
 
     return sites
 

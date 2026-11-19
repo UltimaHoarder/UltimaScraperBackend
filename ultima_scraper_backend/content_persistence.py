@@ -182,8 +182,12 @@ class ContentPersistenceMixin:
         raw_drm = _read_nested(raw_media, "files", "drm") or _read_nested(
             raw_media, "drm"
         )
-        if drm is None and raw_drm is None:
+        # A site may state plainly that the media has no DRM ("drm": False,
+        # as Privacy does): only a truthy value or manifest means DRM.
+        if not drm and not raw_drm:
             return False, {}
+        if drm is None and isinstance(raw_drm, bool):
+            return True, {}
 
         dash = getattr(drm, "dash", None)
         hls = getattr(drm, "hls", None)

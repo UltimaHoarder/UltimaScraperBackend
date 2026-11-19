@@ -257,23 +257,10 @@ class AuthEventHandler:
 
                 session.expunge(account)
 
-            # Build auth_json
-            if self.site.lower() == "onlyfans":
-                auth_json = {
-                    "id": account.user_id,
-                    "username": account.username or "",
-                    "cookie": account.cookie or "",
-                    "x_bc": account.x_bc or "",
-                    "user_agent": account.user_agent or "",
-                    "email": account.email or "",
-                    "password": account.password or "",
-                }
-            else:
-                logger.warning(f"Site {self.site} not supported for auth events")
-                return
+            from .usapi_initializer import site_auth_json
 
             auth_json = apply_assigned_proxy_to_auth_json(
-                auth_json, getattr(account, "proxy_id", None)
+                site_auth_json(self.site, account), getattr(account, "proxy_id", None)
             )
 
             # Full login with WebSocket

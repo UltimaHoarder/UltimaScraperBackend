@@ -19,7 +19,11 @@ Key Features:
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +39,50 @@ from ultima_scraper_api.apis.onlyfans.classes.only_drm import (
 from ultima_scraper_db_archive import content_types as db_content_types
 
 from .path_formatter import FormatAttributes, PathFormatter
+
+
+def _image_request_filename(segment: str) -> str | None:
+    """The file an image-handler URL asks for, or None.
+
+    Image handlers in the style of AWS's Serverless Image Handler (Privacy's
+    image.privacy.com.br is one) put the whole request in the path as base64
+    JSON, ``{"bucket", "key", "edits"}``; ``key`` names the stored file.
+    """
+    if not segment.startswith("eyJ"):  # base64 of '{"'
+        return None
+    padded = segment + "=" * (-len(segment) % 4)
+    for decode in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            request = json.loads(decode(padded))
+        except (binascii.Error, ValueError):
+            continue
+        key = request.get("key") if isinstance(request, dict) else None
+        name = Path(key).name if isinstance(key, str) else ""
+        return name or None
+    return None
+
+
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def _is_fastevo_token(value: object) -> bool:
+    from ultima_scraper_api.apis.onlyfans.classes.only_drm import FASTEVO_TOKEN_PREFIX
+
+    return isinstance(value, str) and value.startswith(FASTEVO_TOKEN_PREFIX)
+
+
+def url_filename(url: str) -> str:
+    """The file name a media URL saves as ("" when its path has none).
+
+    A file kept in a folder of its own named by a UUID (DarkFans stores every
+    upload as ``.../<upload id>/originalWatermarked.webp``) is named by that
+    folder: the file's own name is the same for every upload.
+    """
+    path = Path(urlparse(url).path)
+    name = path.name
+    if name and _UUID.fullmatch(path.parent.name):
+        return path.parent.name + path.suffix
+    return _image_request_filename(name) or name
 
 if TYPE_CHECKING:
     from .download_manager import DownloadItem
@@ -420,7 +468,7 @@ class MediaMetadata:
                 f"MediaMetadata {self.media_id} has no content metadata for formatting"
             )
 
-        normalized_base_name = base_name.replace(".mpd", ".mp4")
+        normalized_base_name = base_name.replace(".mpd", ".mp4").replace(".m3u8", ".mp4")
         content_value = "Free"
         if content_metadata.price > 0:
             content_value = (
@@ -518,7 +566,7 @@ class MediaMetadata:
             raise ValueError(f"MediaMetadata {self.media_id} has no primary URL")
 
         target_filename = filename or self.filename or self.extract_filename_from_url()
-        target_filename = target_filename.replace(".mpd", ".mp4")
+        target_filename = target_filename.replace(".mpd", ".mp4").replace(".m3u8", ".mp4")
         target_directory = directory or self.directory or base_directory
 
         if (
@@ -594,7 +642,7 @@ class MediaMetadata:
         api_user: Any | None = None,
         directory_hint: Path | None = None,
     ) -> str:
-        target_filename = base_name.replace(".mpd", ".mp4")
+        target_filename = base_name.replace(".mpd", ".mp4").replace(".m3u8", ".mp4")
         if api_user is None:
             return target_filename
 
@@ -639,10 +687,10 @@ class MediaMetadata:
         if not parsed.path:
             raise ValueError(f"Media {self.media_id} URL has no path: {url}")
 
-        filename = Path(parsed.path).name
+        filename = url_filename(url)
         if not filename:
             raise ValueError(f"Media {self.media_id} URL path has no filename: {url}")
-        filename = filename.replace(".mpd", ".mp4")
+        filename = filename.replace(".mpd", ".mp4").replace(".m3u8", ".mp4")
 
         return filename
 
@@ -873,7 +921,7 @@ class ContentMetadata:
                     for url_record in matching_urls or media_url_list:
                         _append_unique_url(urls, getattr(url_record, "url", None))
 
-                filename = Path(urlparse(urls[0]).path).name if urls else None
+                filename = url_filename(urls[0]) or None if urls else None
                 drm_manifest = getattr(media_item, "drm_manifest", None)
                 drm_media: Any | None = None
                 dash_manifest = getattr(drm_manifest, "dash_manifest", None)
@@ -892,6 +940,23 @@ class ContentMetadata:
                         manifest_url=str(dash_manifest),
                         key_pair_id=str(dash_key_pair_id),
                         policy=str(dash_policy),
+                        signature=str(dash_signature),
+                        content_id=content_id,
+                        video_url=drm_manifest.video_url,
+                        audio_url=drm_manifest.audio_url,
+                        video_size=getattr(drm_manifest, "video_size", None),
+                        audio_size=getattr(drm_manifest, "audio_size", None),
+                        content_type=content_type,
+                    )
+                    filename = drm_media.resolve_filename() or filename
+                elif dash_manifest and _is_fastevo_token(dash_signature):
+                    # DarkFans: the Fastevo play token is what plays the
+                    # manifest; there are no CloudFront cookies.
+                    drm_media = DRMMedia(
+                        media_id=media_id,
+                        manifest_url=str(dash_manifest),
+                        key_pair_id="",
+                        policy="",
                         signature=str(dash_signature),
                         content_id=content_id,
                         video_url=drm_manifest.video_url,

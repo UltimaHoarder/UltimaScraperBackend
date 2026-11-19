@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 # Tries at a file's HEAD request before a dropped connection fails the file.
 HEAD_ATTEMPTS = 4
+# HEAD answers from servers that serve the file to GET all the same.
+HEAD_REFUSED_STATUSES = (403, 405)
 
 if TYPE_CHECKING:
     from ..database.write_queue import DatabaseWriteClient
@@ -460,6 +462,31 @@ def _move_file_sync(src: Path, dest: Path) -> None:
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dest))
+
+
+def _site_stream_downloader(
+    item: DownloadItem,
+) -> Callable[[Path], Awaitable[Path]] | None:
+    """The site's own saver for ``item.url`` (its auth's
+    ``stream_downloader``), or None when a plain GET fetches it."""
+    user = item.user
+    authed = getattr(user, "get_authed", lambda: None)() if user is not None else None
+    stream_downloader = getattr(authed, "stream_downloader", None)
+    if not callable(stream_downloader) or not item.url:
+        return None
+    return stream_downloader(item.url)
+
+
+def _site_request_headers(item: DownloadItem) -> dict[str, str]:
+    """Headers the site needs on a plain GET of ``item.url`` (its auth's
+    ``media_request_headers``, e.g. Privacy's Referer), or none."""
+    user = item.user
+    authed = getattr(user, "get_authed", lambda: None)() if user is not None else None
+    media_request_headers = getattr(authed, "media_request_headers", None)
+    if not callable(media_request_headers) or not item.url:
+        return {}
+    headers = media_request_headers(item.url)
+    return dict(headers) if isinstance(headers, dict) else {}
 
 
 class DownloadManager:
@@ -902,6 +929,7 @@ class DownloadManager:
                         if response.status == 200:
                             return response
                         else:
+                            item.http_status = response.status
                             logger.warning(
                                 f"HEAD request failed: {response.status} for {item.url}"
                             )
@@ -975,7 +1003,13 @@ class DownloadManager:
                 actual_start = start_byte + written
                 headers = {
                     **item.headers,
-                    "Range": f"bytes={actual_start}-{end_byte}",
+                    # Without a known size there is no end to name: ask for
+                    # the rest, or a server that honours ranges sends 1 byte.
+                    "Range": (
+                        f"bytes={actual_start}-{end_byte}"
+                        if item.size
+                        else f"bytes={actual_start}-"
+                    ),
                 }
 
                 try:
@@ -1205,6 +1239,11 @@ class DownloadManager:
             or only_drm is None
         ):
             logger.error("[DRM] Missing DRM context for media %s", item.media_id)
+            if only_drm is None and authed is not None:
+                # OnlyFans without a Widevine device, or a site whose DRM
+                # this backend can't decrypt (DarkFans' Fastevo videos).
+                site_name = getattr(getattr(authed, "api", None), "site_name", "this site")
+                item.failure_message = f"No DRM decryption available for {site_name} videos"
             return await self._fail_download(item)
 
         cookies = drm_media.get_cookies()
@@ -1403,6 +1442,15 @@ class DownloadManager:
     ) -> tuple[int, int, Path] | Literal[False]:
         head_response = await self.head_request(item)
         if not head_response:
+            if item.http_status in HEAD_REFUSED_STATUSES:
+                # Some servers answer only GET (Privacy's image handler says
+                # 403 to HEAD); fetch without knowing the size. A GET that is
+                # refused too fails the download as before.
+                logger.info(
+                    f"Server refused HEAD ({item.http_status}); downloading without a size: {item.url}"
+                )
+                item.http_status = None
+                return self._plan_download(item, item.size or 0)
             logger.error(f"Failed to get file info for {item.url}")
             return False
         return self._plan_download(item, head_response.content_length or item.size or 0)
@@ -1448,6 +1496,19 @@ class DownloadManager:
         item.downloaded_this_run = True
         return await self._complete_download(item, final_size)
 
+    async def _download_site_stream(
+        self,
+        item: DownloadItem,
+        site_download: Callable[[Path], Awaitable[Path]],
+    ) -> bool:
+        dest_path = item.get_filepath()
+        await asyncio.to_thread(dest_path.parent.mkdir, parents=True, exist_ok=True)
+        saved = await site_download(dest_path)
+        final_size = saved.stat().st_size
+        item.size = final_size
+        item.downloaded_this_run = True
+        return await self._complete_download(item, final_size)
+
     async def download(self, item: DownloadItem) -> bool:
         """
         Download a single item.
@@ -1465,10 +1526,19 @@ class DownloadManager:
         dest_path = item.get_filepath()
 
         try:
+            # A site whose files a plain GET can't fetch (Privacy's video
+            # playlists) saves them itself.
+            site_download = _site_stream_downloader(item)
+            # Headers already on the item win over the site's.
+            item.headers = {**_site_request_headers(item), **item.headers}
             # Check if file already exists
             if file_has_content(dest_path):
                 existing_size = dest_path.stat().st_size
                 known_size = item.size
+                if known_size is None and site_download is not None:
+                    # The URL is a playlist; its size says nothing about the file.
+                    logger.debug(f"File already exists: {dest_path}")
+                    return await self._complete_download(item, existing_size)
                 if known_size is None and not (
                     item.media_metadata and item.media_metadata.drm
                 ):
@@ -1482,6 +1552,8 @@ class DownloadManager:
 
             if item.media_metadata and item.media_metadata.drm:
                 return await self._download_drm(item)
+            if site_download is not None:
+                return await self._download_site_stream(item, site_download)
             return await self._download_regular(item)
 
         except Exception as exc:

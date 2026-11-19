@@ -1355,8 +1355,13 @@ class _DRMPipeline:
             return True
 
         stream_bytes = sum(stream.stat().st_size for stream in enc_streams if stream.exists())
-        if self.remote_store is not None and await self._owner_decrypts(
-            stream_bytes, can_decrypt_here=only_drm is not None
+        # A site that decrypts its own streams (Fastevo) can't be decrypted by
+        # the owner, whose decrypt is mp4decrypt.
+        decrypts_own = bool(getattr(only_drm, "decrypts_own_streams", False))
+        if (
+            self.remote_store is not None
+            and not decrypts_own
+            and await self._owner_decrypts(stream_bytes, can_decrypt_here=only_drm is not None)
         ):
             return await self._decrypt_on_owner(item, enc_streams, drm_key, dest_path)
 
@@ -1547,7 +1552,11 @@ async def _decrypt_and_merge(
     those again. False when it can't, and the caller decrypts with mp4decrypt.
     """
     formatter = getattr(only_drm, "media_formatter", None)
-    # The key is KID:KEY; ffmpeg wants the key alone.
+    # The key is KID:KEY; ffmpeg wants the key alone. Several pairs (tracks
+    # with their own keys, as Fastevo's can be) are mp4decrypt's: it picks
+    # each track's key by KID, where ffmpeg would apply one to every input.
+    if len(drm_key.split()) != 1 or getattr(only_drm, "decrypts_own_streams", False):
+        return False
     key = drm_key.rsplit(":", 1)[-1]
     if formatter is None or not streams or not _CONTENT_KEY.fullmatch(key):
         return False

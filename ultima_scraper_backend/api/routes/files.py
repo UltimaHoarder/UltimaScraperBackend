@@ -29,6 +29,7 @@ from ultima_scraper_db_archive import (
 
 from ...config import UltimaScraperCollectionConfig
 from ...database.factory import MultiSiteDatabaseManager
+from ...job_system.metadata_models import url_filename
 from ...job_system.path_formatter import FormatAttributes, PathFormatter
 from ...manager import BackendManager
 from ..dependencies import get_backend_manager, get_config
@@ -82,7 +83,8 @@ async def iterfile(
 
 
 def _extract_filename_from_url(media_url: str) -> str:
-    filename = media_url.split("/")[-1].split("?")[0].strip()
+    # The name the download saved it under.
+    filename = url_filename(media_url).strip()
     if not filename:
         raise HTTPException(status_code=404, detail="Media filename not found")
     return filename

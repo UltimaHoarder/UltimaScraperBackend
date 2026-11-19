@@ -13,6 +13,7 @@ from ...job_system import JobSchedule
 from ...job_system.templates import JobTemplate
 from .job_schemas import BackendStrategyPayload, JobScheduleRequest, JobTemplateResponse, JobTemplateTaskPayload, JsonValue, RetryPolicyPayload, TemplateParameterPayload
 from .job_views import _stringify_mapping
+from ...sites import site_title
 
 if TYPE_CHECKING:
     from ...job_system.templates import TemplateParameterDefinition
@@ -31,7 +32,7 @@ CONTENT_TYPE_MAP: dict[str, ContentType] = {
 }
 
 
-type SupportedSiteName = Literal["OnlyFans", "Fansly", "LoyalFans"]
+type SupportedSiteName = Literal["OnlyFans", "Fansly", "LoyalFans", "Privacy", "DarkFans"]
 
 
 def _coerce_json_value(value: object) -> JsonValue:
@@ -175,16 +176,7 @@ def _normalize_site_name(site: str) -> str:
     Returns:
         Properly formatted site name ('OnlyFans', 'Fansly', 'LoyalFans')
     """
-    site_lower = site.lower()
-    if site_lower == "onlyfans":
-        return "OnlyFans"
-    elif site_lower == "fansly":
-        return "Fansly"
-    elif site_lower == "loyalfans":
-        return "LoyalFans"
-    else:
-        # Default to original if unknown
-        return site
+    return site_title(site)
 
 
 def _normalize_max_items(raw_value: object) -> int | None:

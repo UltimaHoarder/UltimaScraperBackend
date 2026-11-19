@@ -44,6 +44,7 @@ from ultima_scraper_backend.helpers.background_tasks import spawn_background_tas
 from ultima_scraper_backend.redis.keys import WATCHES_PAUSED_KEY
 from ultima_scraper_backend.redis_channels import HOOKS_CHANNEL, KEY_PREFIX
 from ultima_scraper_db_archive.site import SubscriptionModel, UserModel
+from .sites import SUPPORTED_SITE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +128,11 @@ def _extract_site_name(source_id: Optional[Union[str, int]]) -> str:
 
     if isinstance(source_id, str) and ":" in source_id:
         site_name = source_id.split(":")[0].lower()
-        if site_name in ["onlyfans", "fansly", "loyalfans"]:
+        if site_name in SUPPORTED_SITE_KEYS:
             return site_name
         raise ValueError(
             f"Invalid site name '{site_name}' in source_id '{source_id}'. "
-            f"Expected: onlyfans, fansly, or loyalfans"
+            f"Expected one of: {', '.join(SUPPORTED_SITE_KEYS)}"
         )
 
     # Malformed source_id

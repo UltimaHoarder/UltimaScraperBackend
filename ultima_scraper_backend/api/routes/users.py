@@ -22,6 +22,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.sql import visitors
 from sqlmodel import select
 from ultima_scraper_api import get_enabled_sites, user_types
+import ultima_scraper_api
 from ultima_scraper_api.apis.fansly.fansly import FanslyAPI
 from ultima_scraper_api.apis.onlyfans.onlyfans import OnlyFansAPI
 
@@ -49,6 +50,7 @@ from ...services.user_stats_cache import user_stats_cache
 from ...usapi_initializer import (
     AssignedProxyResolutionError,
     resolve_assigned_proxy_url,
+    site_auth_json,
 )
 from ..dependencies import get_backend_instance, get_backend_manager
 from ...database.threads import run_database_call
@@ -57,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 from ...services.profile_refresh import queue_cached_profile_refresh
 from ...services import favourites_service
+from ...sites import ENABLED_SITE_KEYS, site_title
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -235,7 +238,7 @@ def _normalize_utc(dt: datetime | None) -> datetime | None:
 def _get_site_display_name(site: str) -> str:
     """Return the human-readable site name used by the auth bootstrap flow."""
 
-    return "OnlyFans" if site.strip().lower() == "onlyfans" else "Fansly"
+    return site_title(site.strip().lower())
 
 
 def _extract_description_terms(value: str | None) -> list[str]:
@@ -1057,7 +1060,7 @@ async def _get_authenticated_api(
                     return auth
             return None
 
-        if site_lower not in {"onlyfans", "fansly"}:
+        if site_lower not in SUPPORTED_SITES:
             logger.warning("Unsupported site for authenticated lookup: %s", site)
             return None
 
@@ -1084,26 +1087,13 @@ async def _get_authenticated_api(
 
         guest_proxy_url: str | None = None
         for auth_record in auths:
+            auth_json = site_auth_json(site_lower, auth_record)
             if site_lower == "onlyfans":
-                auth_json = {
-                    "id": auth_record.user_id,
-                    "username": auth_record.username or "",
-                    "cookie": auth_record.cookie or "",
-                    "x_bc": auth_record.x_bc or "",
-                    "user_agent": auth_record.user_agent or "",
-                }
                 api = OnlyFansAPI()
             elif site_lower == "fansly":
-                auth_json = {
-                    "id": auth_record.user_id,
-                    "username": auth_record.username or "",
-                    "authorization": auth_record.authorization or "",
-                    "user_agent": auth_record.user_agent or "",
-                }
                 api = FanslyAPI()
             else:
-                logger.warning(f"Unsupported site: {site}")
-                return None
+                api = ultima_scraper_api.select_api(site_lower)
 
             try:
                 proxy_url = resolve_assigned_proxy_url(auth_record.proxy_id)
@@ -1315,15 +1305,12 @@ async def search_user(
     try:
         # Normalize site name
         site_lower = site.strip().lower()
-        if site_lower == "onlyfans":
-            site_display = "OnlyFans"
-        elif site_lower == "fansly":
-            site_display = "Fansly"
-        else:
+        if site_lower not in ENABLED_SITE_KEYS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported site: {site}. Supported: onlyfans, fansly",
+                detail=f"Unsupported site: {site}. Supported: {', '.join(ENABLED_SITE_KEYS)}",
             )
+        site_display = site_title(site_lower)
 
         # Clean username (remove @ if present)
         username = username.strip().lstrip("@")
@@ -1377,7 +1364,7 @@ async def resolve_profile_identifier(
     """Resolve a profile URL identifier without ever guessing among local claims."""
 
     site_lower = site.strip().lower()
-    if site_lower not in {"onlyfans", "fansly"}:
+    if site_lower not in ENABLED_SITE_KEYS:
         return UserIdentifierResolutionResponse(
             success=False,
             status="unavailable",
@@ -1789,7 +1776,7 @@ async def list_users(
         price_total = 0.0
         has_more = False
 
-        sites_to_query = [site.lower()] if site else ["onlyfans", "fansly"]
+        sites_to_query = [site.lower()] if site else list(ENABLED_SITE_KEYS)
 
         if trimmed_search and site and not stats_only:
             site_db = db_manager.get_or_create_manager(site.lower())
@@ -3113,7 +3100,7 @@ async def _search_and_save_user(
     """
     try:
         site_lower = site.lower()
-        site_display = "OnlyFans" if site_lower == "onlyfans" else "Fansly"
+        site_display = site_title(site_lower)
 
         ident = identifier.strip()
         lookup_value: str | int

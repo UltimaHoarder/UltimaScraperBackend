@@ -135,6 +135,50 @@ def apply_assigned_proxy_to_auth_json(
     return auth_json
 
 
+# The stored sign-in fields each site's API reads (UserAuthModel columns).
+# OnlyFans and LoyalFans sign in with cookies (plus OnlyFans' x-bc); Fansly and
+# Privacy with an authorization token; DarkFans with its BEARER and
+# refresh_token cookies, stored together in ``cookie``.
+_SITE_AUTH_FIELDS: dict[str, tuple[str, ...]] = {
+    "onlyfans": ("cookie", "x_bc", "user_agent", "email", "password"),
+    "loyalfans": ("cookie", "x_bc", "user_agent", "email", "password"),
+    "fansly": ("authorization", "user_agent", "email", "password"),
+    "privacy": ("authorization", "user_agent", "email", "password"),
+    "darkfans": ("cookie", "user_agent", "email"),
+}
+
+
+def site_auth_json(site: str, account: Any) -> dict[str, Any]:
+    """The ``auth_json`` a site's API logs in with, from a stored auth row
+    (or anything with the same attributes)."""
+    fields = _SITE_AUTH_FIELDS.get(site.lower(), _SITE_AUTH_FIELDS["onlyfans"])
+    auth_json: dict[str, Any] = {
+        "id": account.user_id,
+        "username": getattr(account, "username", None) or "",
+    }
+    for field in fields:
+        auth_json[field] = getattr(account, field, None) or ""
+    return auth_json
+
+
+async def login_site_api(
+    api_instance: Any, auth_json: dict[str, Any], *, ignore_auth_errors: bool = False
+) -> Any:
+    """``api_instance.login(auth_json=...)``, passing ``ignore_auth_errors``
+    only to APIs that take it (OnlyFans can build an auth without a request)."""
+    import inspect
+
+    kwargs: dict[str, Any] = {"auth_json": auth_json}
+    if ignore_auth_errors:
+        try:
+            parameters = inspect.signature(api_instance.login).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "ignore_auth_errors" in parameters:
+            kwargs["ignore_auth_errors"] = True
+    return await api_instance.login(**kwargs)
+
+
 def is_auth_in_shard(auth_id: int, worker_index: int, worker_count: int) -> bool:
     """
     Determine if an auth belongs to a worker's shard.
@@ -219,10 +263,7 @@ class USAPIInitializer:
         Returns:
             Initialized OnlyFansAuthModel with database data loaded, or None if login fails
         """
-        if site.lower() != "onlyfans":
-            logger.warning("USAPIInitializer only supports OnlyFans currently")
-            return None
-
+        site_key = site.lower()
         async with self._lock:
             try:
                 # Step 1: Login to API
@@ -233,12 +274,10 @@ class USAPIInitializer:
                     )
                     return None
 
+                # Sites without live updates have no WebSocket connection.
+                websocket_connection = getattr(authed, "websocket_connection", None)
                 # Register WebSocket action handler if available
-                if (
-                    self._ws_action_handler
-                    and hasattr(authed, "websocket_connection")
-                    and authed.websocket_connection
-                ):
+                if self._ws_action_handler and websocket_connection:
                     try:
                         ws_action_handler = self._ws_action_handler
                         # Create callback wrapper for this authed instance
@@ -267,7 +306,7 @@ class USAPIInitializer:
                                 )
 
                         # Use new .on() method instead of register_callback()
-                        authed.websocket_connection.on("message", ws_callback)
+                        websocket_connection.on("message", ws_callback)
                         logger.info(
                             f"Registered WebSocket action handler for account {account_id}"
                         )
@@ -279,11 +318,18 @@ class USAPIInitializer:
                 # Start WebSocket connection after callbacks are attached so
                 # the background listen loop cannot emit early messages before
                 # the handler is registered.
-                await authed.websocket_connection.start()
+                if websocket_connection:
+                    await websocket_connection.start()
 
                 logger.info(
                     f"Logged in account {account_id} ({authed.username}) for initialization"
                 )
+
+                if site_key != "onlyfans":
+                    # The stored subscriptions below are rebuilt as OnlyFans
+                    # models; other sites list theirs from the API when a job
+                    # asks for them.
+                    return authed
 
                 # Step 2: Load database subscriptions
                 db_subscriptions = self._load_db_subscriptions(account_id)
@@ -472,10 +518,6 @@ class USAPIInitializer:
             await execute_job_task(job, auth)
             ```
         """
-        if site.lower() != "onlyfans":
-            logger.warning(f"Cookie auth only supports OnlyFans, got: {site}")
-            return None
-
         from ultima_scraper_db_archive import UserAuthModel
 
         # Load auth data from database
@@ -494,24 +536,17 @@ class USAPIInitializer:
             # Detach from session
             session.expunge(account)
 
-        # Build auth_json from database cookies
-        auth_json = {
-            "id": account.user_id,
-            "username": account.username or "",
-            "cookie": account.cookie or "",
-            "x_bc": account.x_bc or "",
-            "user_agent": account.user_agent or "",
-            "email": account.email or "",
-            "password": account.password or "",
-        }
-        auth_json = apply_assigned_proxy_to_auth_json(auth_json, account.proxy_id)
+        # Build auth_json from the stored sign-in
+        auth_json = apply_assigned_proxy_to_auth_json(
+            site_auth_json(site, account), account.proxy_id
+        )
 
         # Use the API's login method to create/register the auth, but bypass
-        # live auth validation for lazy download tasks that only need stored cookies.
+        # live auth validation (where the site's API can) for lazy download
+        # tasks that only need stored cookies.
         try:
-            authed = await api_instance.login(
-                auth_json=auth_json,
-                ignore_auth_errors=True,
+            authed = await login_site_api(
+                api_instance, auth_json, ignore_auth_errors=True
             )
 
             if not authed:
@@ -847,42 +882,7 @@ async def load_all_accounts_to_api(
 
     for account in accounts:
         try:
-            # Build site-specific auth_json
-            # OnlyFans uses: cookie, x_bc
-            # Fansly uses: authorization
-            # LoyalFans uses: similar to OnlyFans
-
-            if site.lower() == "onlyfans":
-                auth_json = {
-                    "id": account.user_id,  # Use user_id, not account.id
-                    "username": account.username or "",
-                    "cookie": account.cookie or "",
-                    "x_bc": account.x_bc or "",
-                    "user_agent": account.user_agent or "",
-                    "email": account.email or "",
-                    "password": account.password or "",
-                }
-            elif site.lower() == "fansly":
-                auth_json = {
-                    "id": account.user_id,  # Use user_id, not account.id
-                    "username": account.username or "",
-                    "authorization": account.authorization or "",
-                    "user_agent": account.user_agent or "",
-                    "email": account.email or "",
-                    "password": account.password or "",
-                }
-            else:
-                # Default/LoyalFans format (similar to OnlyFans)
-                auth_json = {
-                    "id": account.user_id,
-                    "username": account.username or "",
-                    "cookie": account.cookie or "",
-                    "x_bc": account.x_bc or "",
-                    "user_agent": account.user_agent or "",
-                    "email": account.email or "",
-                    "password": account.password or "",
-                }
-
+            auth_json = site_auth_json(site, account)
             auth_json = apply_assigned_proxy_to_auth_json(
                 auth_json, getattr(account, "proxy_id", None)
             )

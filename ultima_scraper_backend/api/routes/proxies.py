@@ -37,6 +37,7 @@ from ...security import validate_outbound_url
 from ...services.plugin_proxies import guard_proxy_assignment
 from ..dependencies import get_backend_manager, get_config
 from ._auth_event_utils import publish_auth_updated
+from ...sites import ENABLED_SITE_KEYS
 
 _logger = logging.getLogger(__name__)
 
@@ -766,7 +767,7 @@ def list_proxies(
         auths_by_proxy: dict[str, list[int]] = {url: [] for url in all_proxy_urls}
         active_auths_by_proxy: dict[str, int] = {url: 0 for url in all_proxy_urls}
 
-        for site_name in ["onlyfans", "fansly"]:
+        for site_name in ENABLED_SITE_KEYS:
             site_db = db_manager.get_or_create_manager(site_name)
             if not site_db:
                 continue
@@ -903,7 +904,7 @@ async def assign_proxy_to_auth(
     db_manager = MultiSiteDatabaseManager()
 
     # Try to find and update the auth across all sites
-    for site_name in ["onlyfans", "fansly"]:
+    for site_name in ENABLED_SITE_KEYS:
         site_db = db_manager.get_or_create_manager(site_name)
         if not site_db:
             continue
@@ -939,7 +940,7 @@ def get_proxy_auths(proxy_url: str) -> list[ProxyAuthRecord]:
     db_manager = MultiSiteDatabaseManager()
     auths: list[ProxyAuthRecord] = []
 
-    for site_name in ["onlyfans", "fansly"]:
+    for site_name in ENABLED_SITE_KEYS:
         site_db = db_manager.get_or_create_manager(site_name)
         if not site_db:
             continue

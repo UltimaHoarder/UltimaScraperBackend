@@ -7,8 +7,9 @@ from typing import Any
 
 from .models import Task, TaskResult, TaskState
 from .mps_tasks import _build_mps_task_batch
+from ..sites import SUPPORTED_SITE_KEYS, site_title
 
-_PROFILE_SITES = {"onlyfans": "OnlyFans", "fansly": "Fansly", "loyalfans": "LoyalFans"}
+_PROFILE_SITES = {key: site_title(key) for key in SUPPORTED_SITE_KEYS}
 
 
 @dataclass

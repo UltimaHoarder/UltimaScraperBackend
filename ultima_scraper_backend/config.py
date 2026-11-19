@@ -14,11 +14,13 @@ from pydantic import (
     model_serializer,
 )
 from ultima_scraper_api.config import DRM as USAPIDRM
+from ultima_scraper_api.config import DarkFansAPIConfig as USADarkFansAPIConfig
 from ultima_scraper_api.config import FanslyAPIConfig as USAFanslyAPIConfig
 from ultima_scraper_api.config import LoyalFansAPIConfig as USALoyalFansAPIConfig
 from ultima_scraper_api.config import MediaQuality as USAPIMediaQuality
 from ultima_scraper_api.config import Network as USAPINetwork
 from ultima_scraper_api.config import OnlyFansAPIConfig as USAOnlyFansAPIConfig
+from ultima_scraper_api.config import PrivacyAPIConfig as USAPrivacyAPIConfig
 from ultima_scraper_api.config import Proxy as USAPIProxy
 from ultima_scraper_api.config import ProxyGroupSettings
 from ultima_scraper_api.config import Redis as USAPIRedisConfig
@@ -519,7 +521,7 @@ class WorkerPool(BaseModel):
     # Ledger tasks reserved per claim; null uses the ledger batch size.
     claim_batch_size: int | None = Field(default=None, ge=1)
     sites: list[str] = Field(
-        default_factory=lambda: ["onlyfans", "fansly"]
+        default_factory=lambda: ["onlyfans", "fansly", "privacy", "darkfans"]
     )  # Sites this worker pool can handle
 
 
@@ -560,22 +562,38 @@ class LoyalFansAPIConfig( BaseModel):
     cache: LoyalFansCache = LoyalFansCache()
 
 
+class PrivacyAPIConfig(GlobalAPI):
+    class PrivacyCache(GlobalCache):
+        pass
+
+    cache: PrivacyCache = PrivacyCache()
+
+
+class DarkFansAPIConfig(GlobalAPI):
+    class DarkFansCache(GlobalCache):
+        pass
+
+    cache: DarkFansCache = DarkFansCache()
+
+
 class Sites(BaseModel):
     OnlyFansAPIConfig: ClassVar[type[OnlyFansAPIConfig]] = OnlyFansAPIConfig
     FanslyAPIConfig: ClassVar[type[FanslyAPIConfig]] = FanslyAPIConfig
     LoyalFansAPIConfig: ClassVar[type[LoyalFansAPIConfig]] = LoyalFansAPIConfig
+    PrivacyAPIConfig: ClassVar[type[PrivacyAPIConfig]] = PrivacyAPIConfig
+    DarkFansAPIConfig: ClassVar[type[DarkFansAPIConfig]] = DarkFansAPIConfig
 
     onlyfans: OnlyFansAPIConfig = OnlyFansAPIConfig()
     fansly: FanslyAPIConfig = FanslyAPIConfig()
     loyalfans: LoyalFansAPIConfig = LoyalFansAPIConfig()
+    privacy: PrivacyAPIConfig = PrivacyAPIConfig()
+    darkfans: DarkFansAPIConfig = DarkFansAPIConfig()
 
     def get_settings(self, site_name: str):
-        if site_name == "OnlyFans":
-            return self.onlyfans
-        elif site_name == "Fansly":
-            return self.fansly
-        else:
-            return self.loyalfans
+        site_key = site_name.lower()
+        if site_key in type(self).model_fields:
+            return getattr(self, site_key)
+        return self.loyalfans
 
     def to_usapi_sites(self) -> USASites:
         return USASites(
@@ -620,10 +638,44 @@ class Sites(BaseModel):
                     **self.loyalfans.cache.model_dump()
                 ),
             ),
+            privacy=USAPrivacyAPIConfig(
+                media_quality=USAPIMediaQuality(
+                    **self.privacy.media_quality.model_dump()
+                ),
+                webhooks=USAPIWebhooks(
+                    auth=USAPIWebhook(**self.privacy.webhooks.auth.model_dump()),
+                    download=USAPIWebhook(
+                        **self.privacy.webhooks.download.model_dump()
+                    ),
+                ),
+                cache=USAPrivacyAPIConfig.PrivacyCache(
+                    **self.privacy.cache.model_dump()
+                ),
+            ),
+            darkfans=USADarkFansAPIConfig(
+                media_quality=USAPIMediaQuality(
+                    **self.darkfans.media_quality.model_dump()
+                ),
+                webhooks=USAPIWebhooks(
+                    auth=USAPIWebhook(**self.darkfans.webhooks.auth.model_dump()),
+                    download=USAPIWebhook(
+                        **self.darkfans.webhooks.download.model_dump()
+                    ),
+                ),
+                cache=USADarkFansAPIConfig.DarkFansCache(
+                    **self.darkfans.cache.model_dump()
+                ),
+            ),
         )
 
 
-site_config_types = OnlyFansAPIConfig | FanslyAPIConfig
+site_config_types = (
+    OnlyFansAPIConfig
+    | FanslyAPIConfig
+    | LoyalFansAPIConfig
+    | PrivacyAPIConfig
+    | DarkFansAPIConfig
+)
 
 
 def _environment_int(name: str, current: int) -> int:
