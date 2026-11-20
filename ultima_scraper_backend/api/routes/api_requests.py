@@ -13,6 +13,7 @@ from typing import Any, cast
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from ...api_command_sites import enabled_sites
 from ...manager import API_COMMANDS, APICommandArg, BackendManager
 from ..dependencies import get_backend_manager
 
@@ -52,8 +53,9 @@ def _build_allowed_methods() -> dict[str, dict[str, Any]]:
             "description": descriptor.description,
             "args": {arg.name: _arg_schema(arg) for arg in descriptor.args},
         }
-        if descriptor.sites:
-            method_payload["sites"] = list(descriptor.sites)
+        sites = descriptor.sites
+        if sites is not None:
+            method_payload["sites"] = list(sites)
         methods[descriptor.name] = method_payload
     return methods
 
@@ -81,8 +83,12 @@ class APIRequestResponse(BaseModel):
 
 @router.get("/methods")
 async def list_methods() -> dict[str, Any]:
-    """Return the catalogue of available API methods and their arguments."""
-    return {"methods": ALLOWED_METHODS}
+    """Return the catalogue of available API methods and their arguments.
+
+    ``sites`` lists the enabled sites; each method's ``sites`` lists those it
+    runs on.
+    """
+    return {"methods": ALLOWED_METHODS, "sites": enabled_sites()}
 
 
 @router.post("/execute", response_model=APIRequestResponse)

@@ -152,22 +152,32 @@ class APICommandDescriptor:
     description: str
     handler: str
     args: Sequence[APICommandArg] = ()
-    sites: Optional[Sequence[str]] = None
+    # The authenticated-session methods this command calls; a site can run it
+    # when its auth model has any one of them (see api_command_sites).
+    auth_methods: Sequence[str] = ()
+
+    @property
+    def sites(self) -> tuple[str, ...] | None:
+        """Sites that can run this command; None when any site can."""
+        if not self.auth_methods:
+            return None
+        from ultima_scraper_backend.api_command_sites import sites_supporting
+
+        return sites_supporting(tuple(self.auth_methods))
 
     def to_dict(self) -> dict[str, Any]:
+        sites = self.sites
         return {
             "name": self.name,
             "label": self.label,
             "description": self.description,
             "args": [arg.to_dict() for arg in self.args],
-            "sites": list(self.sites) if self.sites else None,
+            "sites": list(sites) if sites is not None else None,
         }
 
     def allows_site(self, site: str) -> bool:
-        if not self.sites:
-            return True
-        site_key = site.lower()
-        return any(site_key == allowed.lower() for allowed in self.sites)
+        sites = self.sites
+        return sites is None or site.lower() in sites
 
 
 API_COMMANDS: tuple[APICommandDescriptor, ...] = (
@@ -176,13 +186,14 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Account Profile",
         description="Fetch the authenticated account profile for the stored credentials.",
         handler="_cmd_get_authed_user",
-        sites=("onlyfans",),
+        auth_methods=("get_authed_user",),
     ),
     APICommandDescriptor(
         name="get_user",
         label="Lookup User",
         description="Fetch a user profile by username or numeric identifier.",
         handler="_cmd_get_user",
+        auth_methods=("get_user",),
         args=(
             APICommandArg(
                 name="identifier",
@@ -198,7 +209,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Lists",
         description="Retrieve account lists (blacklists, favorites, etc.).",
         handler="_cmd_get_lists",
-        sites=("onlyfans",),
+        auth_methods=("get_lists",),
         args=(
             APICommandArg(
                 name="limit",
@@ -221,7 +232,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Subscriptions",
         description="List subscriptions followed by the authenticated account.",
         handler="_cmd_get_subscriptions",
-        sites=("onlyfans",),
+        auth_methods=("get_subscriptions",),
         args=(
             APICommandArg(
                 name="limit",
@@ -252,7 +263,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Transactions",
         description="Fetch recent transaction activity for the account.",
         handler="_cmd_get_transactions",
-        sites=("onlyfans",),
+        auth_methods=("get_transactions",),
         args=(
             APICommandArg(
                 name="limit",
@@ -268,7 +279,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Chats",
         description="List all chats/conversations for the authenticated account.",
         handler="_cmd_get_chats",
-        sites=("onlyfans",),
+        auth_methods=("get_chats",),
         args=(
             APICommandArg(
                 name="limit",
@@ -291,7 +302,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Search Chats",
         description="Search chats by username or message text.",
         handler="_cmd_search_chats",
-        sites=("onlyfans",),
+        auth_methods=("search_chats", "get_chats(search)"),
         args=(
             APICommandArg(
                 name="query",
@@ -322,7 +333,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Messages",
         description="Retrieve messages from a specific user/chat.",
         handler="_cmd_get_messages",
-        sites=("onlyfans",),
+        auth_methods=("get_user",),
         args=(
             APICommandArg(
                 name="user_id",
@@ -360,7 +371,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Paid Content",
         description="Retrieve paid posts and messages (mass messages, PPV, etc).",
         handler="_cmd_get_paid_content",
-        sites=("onlyfans",),
+        auth_methods=("get_paid_content",),
         args=(
             APICommandArg(
                 name="performer_id",
@@ -390,7 +401,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Mass Message Stats",
         description="Retrieve aggregate mass-message statistics for the authenticated account.",
         handler="_cmd_get_mass_message_stats",
-        sites=("onlyfans",),
+        auth_methods=("get_mass_message_stats",),
         args=(
             APICommandArg(
                 name="limit",
@@ -413,14 +424,14 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Subscription Count",
         description="Retrieve subscription and subscriber counts broken down by category.",
         handler="_cmd_get_subscription_count",
-        sites=("onlyfans",),
+        auth_methods=("get_subscription_count",),
     ),
     APICommandDescriptor(
         name="blocked_users",
         label="Blocked Users",
         description="Retrieve blocked users for the authenticated account.",
         handler="_cmd_blocked_users",
-        sites=("onlyfans",),
+        auth_methods=("blocked_users",),
         args=(
             APICommandArg(
                 name="limit",
@@ -443,7 +454,7 @@ API_COMMANDS: tuple[APICommandDescriptor, ...] = (
         label="Restricted Users",
         description="Retrieve restricted users for the authenticated account.",
         handler="_cmd_restricted_users",
-        sites=("onlyfans",),
+        auth_methods=("restricted_users",),
         args=(
             APICommandArg(
                 name="limit",

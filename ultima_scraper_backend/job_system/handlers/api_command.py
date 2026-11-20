@@ -446,12 +446,29 @@ async def _invoke_auth_method(
         raise RuntimeError(
             f"Authenticated session does not support '{method_name}' for this site."
         )
-    result = method(*args, **kwargs)
+    return await _call_supported(method, method_name, *args, **kwargs)
+
+
+async def _call_supported(
+    method: Callable[..., Any], method_name: str, *args: Any, **kwargs: Any
+) -> Any:
+    """Await ``method`` with only the keyword arguments it takes.
+
+    Sites implement the same call with different options (LoyalFans' get_chats
+    takes no offset, for one), so an option a site lacks is left out.
+    """
+    result = method(*args, **_supported_kwargs(method, kwargs))
     if not inspect.isawaitable(result):
         raise RuntimeError(
             f"Authenticated session returned a non-awaitable result for '{method_name}'."
         )
     return await result
+
+
+def _supported_kwargs(method: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    from ultima_scraper_backend.api_command_sites import accepts
+
+    return {key: value for key, value in kwargs.items() if accepts(method, key)}
 
 
 def _iter_auths(api: Any) -> list[auth_types]:
@@ -465,10 +482,15 @@ def _iter_auths(api: Any) -> list[auth_types]:
 
 def _format_content_item(item: Any, content_type: str) -> dict[str, Any]:
     """Format content item (post/message) for JSON response."""
+    if isinstance(item, Mapping):
+        # Some sites (Fansly's paid content) return the site's JSON as is.
+        return cast(dict[str, Any], _serialize_api_value(item))
+
     result: dict[str, Any] = {
         "id": getattr(item, "id", None),
         "created_at": getattr(item, "createdAt", None)
-        or getattr(item, "postedAt", None),
+        or getattr(item, "postedAt", None)
+        or getattr(item, "created_at", None),
         "text": getattr(item, "text", None),
         "price": getattr(item, "price", None),
         "is_archived": getattr(item, "isArchived", False),
@@ -476,10 +498,11 @@ def _format_content_item(item: Any, content_type: str) -> dict[str, Any]:
     }
 
     # Add media info
-    if hasattr(item, "medias") and item.medias:
-        result["media_count"] = len(item.medias)
+    medias = getattr(item, "medias", None) or getattr(item, "media", None)
+    if isinstance(medias, list) and medias:
+        result["media_count"] = len(medias)
         result["media_types"] = list(
-            {getattr(m, "type", "unknown") for m in item.medias}
+            {str(getattr(m, "type", "unknown")) for m in medias}
         )
 
     # Add author info for messages
@@ -682,9 +705,7 @@ async def _get_chats(
         raise ValueError(f"Invalid limit/offset: {exc}") from exc
 
     try:
-        chats = await _invoke_auth_method(
-            authed, "get_chats", limit=limit_int, offset=offset_int
-        )
+        chats = await _fetch_chats(authed, limit_int, offset_int)
     except Exception as exc:
         logger.exception(
             f"[{context.worker_id}] get_chats failed for site={context.site}"
@@ -696,6 +717,57 @@ async def _get_chats(
     chat_list = cast(list[Any], chats)
 
     return {"chats": chat_list[:limit_int], "count": len(chat_list)}
+
+
+async def _fetch_chats(
+    authed: auth_types, limit: int, offset: int, **kwargs: Any
+) -> Any:
+    """``get_chats`` from ``offset``, skipping the first chats itself on sites
+    whose get_chats has no offset."""
+    from ultima_scraper_backend.api_command_sites import accepts
+
+    method = getattr(cast(Any, authed), "get_chats", None)
+    if callable(method) and offset and not accepts(method, "offset"):
+        chats = await _invoke_auth_method(
+            authed, "get_chats", limit=limit + offset, **kwargs
+        )
+        return cast(list[Any], chats)[offset:] if isinstance(chats, list) else chats
+    return await _invoke_auth_method(
+        authed, "get_chats", limit=limit, offset=offset, **kwargs
+    )
+
+
+async def _search_chats(
+    authed: auth_types, context: TaskRunContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Search chats by username or message text."""
+    query = str(args.get("query") or "").strip()
+    if not query:
+        raise ValueError("Query is required for search_chats.")
+    try:
+        limit_int = max(1, min(int(args.get("limit", 100)), 1000))
+        offset_int = max(0, int(args.get("offset", 0)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid limit/offset: {exc}") from exc
+
+    try:
+        if callable(getattr(authed, "search_chats", None)):
+            chats = await _invoke_auth_method(
+                authed, "search_chats", query=query, limit=limit_int, offset=offset_int
+            )
+        else:
+            # Fansly searches through get_chats.
+            chats = await _fetch_chats(authed, limit_int, offset_int, search=query)
+    except Exception as exc:
+        logger.exception(
+            f"[{context.worker_id}] search_chats failed for site={context.site}"
+        )
+        raise RuntimeError(f"search_chats failed: {exc}") from exc
+
+    if not isinstance(chats, list):
+        return {"chats": chats, "query": query}
+    chat_list = cast(list[Any], chats)[:limit_int]
+    return {"chats": chat_list, "query": query, "count": len(chat_list)}
 
 
 async def _get_messages(
@@ -710,8 +782,13 @@ async def _get_messages(
 
     try:
         limit_int = max(1, min(int(limit), 100))
+        page: dict[str, int] = {
+            key: int(args[key])
+            for key in ("offset_id", "cutoff_id")
+            if args.get(key) not in (None, "")
+        }
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid limit: {exc}") from exc
+        raise ValueError(f"Invalid get_messages arguments: {exc}") from exc
 
     # Parse user_id
     lookup = _parse_identifier(user_id_arg, field_name="user_id")
@@ -730,7 +807,14 @@ async def _get_messages(
 
     # Get messages
     try:
-        messages = await user.get_messages(limit=limit_int)
+        get_messages = getattr(user, "get_messages", None)
+        if not callable(get_messages):
+            raise RuntimeError("This site's users have no messages to fetch.")
+        # Sites without message ids to page from (LoyalFans, Privacy,
+        # DarkFans) take only a limit.
+        messages = await _call_supported(
+            get_messages, "get_messages", limit=limit_int, **page
+        )
     except Exception as exc:
         logger.exception(
             f"[{context.worker_id}] Failed to fetch messages from user {lookup}"
@@ -759,24 +843,32 @@ async def _get_paid_content(
     """Retrieve paid posts and messages."""
     performer_id_arg = args.get("performer_id")
     limit = args.get("limit", 10)
+    offset = args.get("offset", 0)
 
     try:
         limit_int = max(1, min(int(limit), 100))
+        offset_int = max(0, int(offset))
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid limit: {exc}") from exc
+        raise ValueError(f"Invalid limit/offset: {exc}") from exc
 
-    # Parse optional performer_id filter
-    performer_lookup: int | str | None = None
-    if performer_id_arg:
-        try:
-            performer_lookup = int(performer_id_arg)
-        except (ValueError, TypeError):
-            performer_lookup = str(performer_id_arg).strip() or None
-
-    # Get paid content
     try:
+        # A username is looked up; the sites filter by the performer's id.
+        performer_id: int | None = None
+        performer_ref = str(performer_id_arg or "").strip()
+        if performer_ref.isdigit():
+            performer_id = int(performer_ref)
+        elif performer_ref:
+            performer = await _invoke_auth_method(authed, "get_user", performer_ref)
+            if performer is None:
+                raise RuntimeError(f"User not found: {performer_ref}")
+            performer_id = getattr(performer, "id", None)
+
         paid_content = await _invoke_auth_method(
-            authed, "get_paid_contents", limit=limit_int
+            authed,
+            "get_paid_content",
+            performer_id=performer_id,
+            limit=limit_int,
+            offset=offset_int,
         )
     except Exception as exc:
         logger.exception(
@@ -785,19 +877,8 @@ async def _get_paid_content(
         raise RuntimeError(f"get_paid_content failed: {exc}") from exc
 
     if not isinstance(paid_content, list):
-        return {"paid_content": paid_content}
+        return {"paid_content": _serialize_api_value(paid_content)}
     paid_content_list = cast(list[Any], paid_content)
-
-    # Filter by performer if specified
-    if performer_lookup is not None:
-        paid_content_list = [
-            item
-            for item in paid_content_list
-            if (
-                getattr(item, "user_id", None) == performer_lookup
-                or getattr(item, "username", None) == performer_lookup
-            )
-        ]
 
     # Format content
     formatted = [
@@ -942,6 +1023,7 @@ _API_COMMAND_HANDLERS: dict[str, APICommandHandler] = {
     "get_subscription_count": _get_subscription_count,
     "get_transactions": _get_transactions,
     "get_chats": _get_chats,
+    "search_chats": _search_chats,
     "get_messages": _get_messages,
     "get_mass_message_stats": _get_mass_message_stats,
     "get_paid_content": _get_paid_content,
