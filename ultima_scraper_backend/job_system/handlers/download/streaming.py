@@ -312,6 +312,10 @@ async def _download_selected_media(
         database_write_site=task.site_name,
         database_write_scope=task.task_id,
     )
+    from ...shared_media import shared_media_copies
+
+    # Media already saved under another post, story or message is linked, not fetched.
+    manager.find_existing_copy = shared_media_copies(db_manager, config)
     preview_limit = positive_budget(
         "ULTIMA_TASK_RESULT_PREVIEW_MAX_ENTRIES", batch_size
     )

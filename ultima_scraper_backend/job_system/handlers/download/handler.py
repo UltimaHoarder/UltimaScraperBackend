@@ -385,6 +385,14 @@ async def _download_content_batch(
 
     use_kept_copies(download_items, destination_selection, base_destination)
 
+    # Before any network request: media another post, story or message already
+    # saved is hardlinked (or copied) into place, so it counts as on disk below.
+    from ...shared_media import SharedMediaCopies, reuse_shared_copies
+
+    shared_copies = getattr(download_manager, "find_existing_copy", None)
+    if isinstance(shared_copies, SharedMediaCopies):
+        await asyncio.to_thread(reuse_shared_copies, download_items, shared_copies)
+
     # Categorize media items by expiry status
     valid_items, skipped_items = categorize_media_items(download_items)
     skipped_items.extend(construction_failures)

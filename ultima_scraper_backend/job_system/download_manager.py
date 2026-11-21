@@ -39,6 +39,8 @@ from ultima_scraper_backend.config import (
     UltimaScraperCollectionConfig,
 )
 
+from .shared_media import place_existing_copy
+
 logger = logging.getLogger(__name__)
 
 # Tries at a file's HEAD request before a dropped connection fails the file.
@@ -587,6 +589,10 @@ class DownloadManager:
         self.on_status: list[StatusCallback] = []
         # Called per successful item; a registered hook owns its staging release.
         self.on_downloaded: list[DownloadedCallback] = []
+        # Finds a finished copy of the item's media saved under another post,
+        # story or message (see shared_media); it is linked instead of fetched.
+        self.find_existing_copy: Callable[[DownloadItem], Path | None] | None = None
+        self.reused_copies: dict[str, int] = {}
 
         # Bytes promised to in-flight items, keyed by staging directory path.
         self._staging_reserved: dict[Path, int] = {}
@@ -1538,6 +1544,28 @@ class DownloadManager:
         item.downloaded_this_run = True
         return await self._complete_download(item, final_size)
 
+    async def _reuse_existing_copy(self, item: DownloadItem, dest_path: Path) -> int | None:
+        """Link or copy the media's finished file from another content type."""
+        finder = getattr(self, "find_existing_copy", None)
+        if finder is None:
+            return None
+        try:
+            source = await asyncio.to_thread(finder, item)
+            if source is None:
+                return None
+            placed = await asyncio.to_thread(place_existing_copy, source, dest_path)
+        except Exception:
+            logger.warning(
+                "Could not reuse an existing copy of media %s", item.media_id, exc_info=True
+            )
+            return None
+        if placed is None:
+            return None
+        how, size = placed
+        self.reused_copies[how] = self.reused_copies.get(how, 0) + 1
+        logger.info("%s media %s from %s to %s", how.capitalize(), item.media_id, source, dest_path)
+        return size
+
     async def download(self, item: DownloadItem) -> bool:
         """
         Download a single item.
@@ -1578,6 +1606,10 @@ class DownloadManager:
                 if known_size is not None and existing_size == known_size:
                     logger.debug(f"File already exists: {dest_path}")
                     return await self._complete_download(item, existing_size)
+            elif getattr(self, "find_existing_copy", None) is not None:
+                reused = await self._reuse_existing_copy(item, dest_path)
+                if reused is not None:
+                    return await self._complete_download(item, reused)
 
             if item.media_metadata and item.media_metadata.drm:
                 return await self._download_drm(item)
