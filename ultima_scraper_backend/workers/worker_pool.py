@@ -1862,6 +1862,32 @@ class Worker:
         except Exception as exc:
             logger.warning(f"[{self.worker_id}] Config reload listener error: {exc}")
 
+    def _refresh_guest_routes(self, config: Any) -> None:
+        """Rebuild the OnlyFans guest session pool and route permits from ``config``.
+
+        Both are built from the proxy list at startup; without this, a proxy
+        edited later is refused by the pool and unmetered by the permits.
+        """
+        api_instance = next(
+            (api for site, api in self.apis.items() if str(site).lower() == "onlyfans"), None
+        )
+        if api_instance is None:
+            return
+        from ..job_system.guest_route_permits import configure_route_permits
+        from ..job_system.guest_sessions import configure_guest_session_pool
+
+        network = config.settings.network
+        configure_guest_session_pool(
+            api_instance, network.proxies,
+            enabled=network.guest_session_pool,
+            worker_index=self.worker_index,
+            worker_count=self.worker_count,
+        )
+        configure_route_permits(
+            self.redis.client if self.redis is not None else None,
+            network.proxies,
+        )
+
     async def _schedule_settings_reload(self, scope: str, version: int | None) -> None:
         existing_task = self._settings_reload_tasks.get(scope)
         if existing_task is not None and not existing_task.done():
@@ -1944,6 +1970,7 @@ class Worker:
                         )
                     ),
                 )
+            self._refresh_guest_routes(fresh_config)
             logger.info(f"[{self.worker_id}] Config and UserManager refreshed")
         except asyncio.CancelledError:
             raise

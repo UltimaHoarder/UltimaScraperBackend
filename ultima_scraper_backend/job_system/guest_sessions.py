@@ -22,6 +22,9 @@ class GuestSessionPool:
     ) -> None:
         if worker_count < 1 or not 0 <= worker_index < worker_count:
             raise ValueError("Invalid guest session worker shard")
+        self.worker_index = worker_index
+        self.worker_count = worker_count
+        self.built_at = time.monotonic()
         # A proxy's connections are dealt round-robin, so together the workers
         # hold about max_connections visitor sessions. Every worker holds at
         # least one on every proxy, even one with fewer connections than there
@@ -80,6 +83,7 @@ def configure_guest_session_pool(
 ) -> bool:
     """Apply network.guest_session_pool; returns whether the pool is active."""
     if not enabled:
+        site_api._guest_session_pool = None
         return False
     from ..usapi_initializer import resolve_proxy_url
 
@@ -92,8 +96,32 @@ def configure_guest_session_pool(
         # e.g. an unresolvable proxy URL: keep the worker running with
         # unpooled guest sessions rather than failing startup.
         logger.warning("Guest session pool disabled: %s", error)
+        site_api._guest_session_pool = None
         return False
     return True
+
+
+# A proxy edited after the worker started is not in its pool yet. Rebuild it
+# from the saved settings, at most this often, rather than refusing the route.
+GUEST_POOL_REBUILD_INTERVAL_SECONDS = 5.0
+
+
+def _guest_session_pool_for(site_api: Any, route: str) -> GuestSessionPool | None:
+    """This worker's pool, rebuilt from the current proxies if ``route`` is new."""
+    pool = getattr(site_api, "_guest_session_pool", None)
+    if pool is None or route in pool.slots:
+        return pool
+    if time.monotonic() - pool.built_at < GUEST_POOL_REBUILD_INTERVAL_SECONDS:
+        return pool
+    from ..config import UltimaScraperCollectionConfig
+
+    network = UltimaScraperCollectionConfig.load_or_create_default_config().settings.network
+    configure_guest_session_pool(
+        site_api, network.proxies, enabled=network.guest_session_pool,
+        worker_index=pool.worker_index, worker_count=pool.worker_count,
+    )
+    logger.info("Rebuilt the guest session pool for proxy settings changed since it was built")
+    return getattr(site_api, "_guest_session_pool", None)
 
 
 # API processes send few guest requests and keep a small fixed share of a
@@ -202,7 +230,7 @@ async def _resolve_guest_auth(
 ) -> Any | None:
     """A request owns its wait, while the route owns its bounded login."""
     normalized_proxy = _normalize_proxy_url(proxy_url)
-    pool = getattr(site_api, "_guest_session_pool", None)
+    pool = _guest_session_pool_for(site_api, normalized_proxy) if normalized_proxy else None
     session_key = pool.select(site_api, normalized_proxy) if pool and normalized_proxy else None
     key = session_key or _guest_cache_key(normalized_proxy)
     cache = getattr(site_api, "_guest_auth_cache", {})
