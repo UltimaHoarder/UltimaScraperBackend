@@ -7,7 +7,10 @@ import glob
 import logging
 import mimetypes
 import re
+import threading
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -65,6 +68,7 @@ class UsernameDirectorySearchResponse(BaseModel):
     checked_patterns: list[str]
     usernames_searched: list[str] = []
     resolved_user_id: int | None = None
+    unavailable_roots: list[str] = []
 
 
 async def iterfile(
@@ -513,77 +517,175 @@ def _resolve_all_usernames(
         return resolved_user_id, all_usernames
 
 
-def _search_username_directories(
+# A slow drive (an sshfs or NFS mount reconnecting, a disk spinning up) must not
+# hold up the whole lookup: the WebUI gives up after 60 s. Each root is scanned on
+# its own thread, and roots that miss the deadline are reported, not waited for.
+USER_DIRECTORY_SCAN_TIMEOUT_SECONDS = 15.0
+_roots_in_flight: set[str] = set()
+_roots_in_flight_lock = threading.Lock()
+
+
+@dataclass
+class UsernameDirectoryScan:
+    matches: list[UsernameDirectoryResult]
+    checked_patterns: list[str]
+    rel_pattern: str
+    unavailable_roots: list[str] = field(default_factory=list)
+
+
+def _scan_root_for_patterns(
+    root: Path, rel_patterns: list[str]
+) -> dict[str, list[UsernameDirectoryResult]]:
+    """Return the matching directories below one root, keyed by relative pattern."""
+    found: dict[str, list[UsernameDirectoryResult]] = {}
+    try:
+        for rel_pattern in rel_patterns:
+            pattern_path = root / rel_pattern
+            try:
+                if "*" in str(pattern_path):
+                    hits = [
+                        candidate
+                        for candidate in root.glob(rel_pattern)
+                        if candidate.exists() and candidate.is_dir()
+                    ]
+                elif pattern_path.exists() and pattern_path.is_dir():
+                    hits = [pattern_path]
+                else:
+                    hits = []
+            except OSError:
+                logger.warning(
+                    "Unable to scan directory during user directory search: %s",
+                    root,
+                    exc_info=True,
+                )
+                continue
+            if hits:
+                found[rel_pattern] = [
+                    UsernameDirectoryResult(root=str(root), path=str(hit))
+                    for hit in hits
+                ]
+    finally:
+        with _roots_in_flight_lock:
+            _roots_in_flight.discard(str(root))
+    return found
+
+
+def _scan_username_directories(
     config: UltimaScraperCollectionConfig,
     usernames: list[str],
     site_name: str,
-) -> tuple[list[UsernameDirectoryResult], list[str], str]:
-    checked_patterns: list[str] = []
-    matches: list[UsernameDirectoryResult] = []
-    rel_patterns = (
+    *,
+    timeout_seconds: float = USER_DIRECTORY_SCAN_TIMEOUT_SECONDS,
+) -> UsernameDirectoryScan:
+    first_rel_patterns = (
         _build_user_directory_relpaths(config, site_name, usernames[0])
         if usernames
         else []
     )
-    rel_pattern = rel_patterns[0] if rel_patterns else ""
-    matched_rel_pattern: str | None = None
+    default_rel_pattern = first_rel_patterns[0] if first_rel_patterns else ""
     mount_points = _load_mount_points()
 
+    rel_patterns: list[str] = []
     for username in usernames:
-        username_rel_patterns = _build_user_directory_relpaths(
-            config, site_name, username
+        for rel_pattern in _build_user_directory_relpaths(config, site_name, username):
+            if rel_pattern not in rel_patterns:
+                rel_patterns.append(rel_pattern)
+
+    roots: list[Path] = []
+    for drive in config.settings.download_setup.drives:
+        if not drive.scan_existing:
+            continue
+        for root in drive.directories:
+            if root in roots:
+                continue
+            if not _has_live_mount(root, mount_points):
+                logger.info(
+                    "Skipping unavailable mounted directory during user directory search: %s",
+                    root,
+                )
+                continue
+            roots.append(root)
+
+    checked_patterns: list[str] = []
+    for rel_pattern in rel_patterns:
+        for root in roots:
+            pattern_str = str(root / rel_pattern)
+            if pattern_str not in checked_patterns:
+                checked_patterns.append(pattern_str)
+
+    unavailable: set[Path] = set()
+    futures: dict[Path, Future[dict[str, list[UsernameDirectoryResult]]]] = {}
+    if roots and rel_patterns:
+        executor = ThreadPoolExecutor(
+            max_workers=len(roots), thread_name_prefix="user-dir-scan"
+        )
+        try:
+            for root in roots:
+                with _roots_in_flight_lock:
+                    busy = str(root) in _roots_in_flight
+                    if not busy:
+                        _roots_in_flight.add(str(root))
+                if busy:
+                    # An earlier lookup is still stuck on this root; don't pile on.
+                    unavailable.add(root)
+                    continue
+                futures[root] = executor.submit(
+                    _scan_root_for_patterns, root, rel_patterns
+                )
+            wait(futures.values(), timeout=timeout_seconds)
+        finally:
+            # Never wait for a stuck mount: its thread finishes on its own and
+            # clears the root from _roots_in_flight when it does.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    results: dict[Path, dict[str, list[UsernameDirectoryResult]]] = {}
+    for root, future in futures.items():
+        if future.done() and not future.cancelled():
+            results[root] = future.result()
+            continue
+        if future.cancelled():
+            with _roots_in_flight_lock:
+                _roots_in_flight.discard(str(root))
+        unavailable.add(root)
+
+    unavailable_roots = [str(root) for root in roots if root in unavailable]
+    if unavailable_roots:
+        logger.warning(
+            "User directory search skipped %d root(s) that did not answer within %.0fs: %s",
+            len(unavailable_roots),
+            timeout_seconds,
+            ", ".join(unavailable_roots),
         )
 
-        for username_rel_pattern in username_rel_patterns:
-            for drive in config.settings.download_setup.drives:
-                if not drive.scan_existing:
-                    continue
-                for root in drive.directories:
-                    if not _has_live_mount(root, mount_points):
-                        logger.info(
-                            "Skipping unavailable mounted directory during user directory search: %s",
-                            root,
-                        )
-                        continue
-                    pattern_path = root / username_rel_pattern
-                    pattern_str = str(pattern_path)
-                    if pattern_str not in checked_patterns:
-                        checked_patterns.append(pattern_str)
-
-                    try:
-                        if "*" in pattern_str:
-                            for candidate in root.glob(username_rel_pattern):
-                                if candidate.exists() and candidate.is_dir():
-                                    if matched_rel_pattern is None:
-                                        matched_rel_pattern = username_rel_pattern
-                                    matches.append(
-                                        UsernameDirectoryResult(
-                                            root=str(root),
-                                            path=str(candidate),
-                                        )
-                                    )
-                        elif pattern_path.exists() and pattern_path.is_dir():
-                            if matched_rel_pattern is None:
-                                matched_rel_pattern = username_rel_pattern
-                            matches.append(
-                                UsernameDirectoryResult(
-                                    root=str(root),
-                                    path=str(pattern_path),
-                                )
-                            )
-                    except OSError:
-                        logger.warning(
-                            "Unable to scan directory during user directory search: %s",
-                            root,
-                            exc_info=True,
-                        )
+    matches: list[UsernameDirectoryResult] = []
+    matched_rel_pattern: str | None = None
+    for rel_pattern in rel_patterns:
+        for root in roots:
+            hits = results.get(root, {}).get(rel_pattern, [])
+            if hits and matched_rel_pattern is None:
+                matched_rel_pattern = rel_pattern
+            matches.extend(hits)
 
     # De-duplicate by path in case multiple roots/drive configs overlap.
     deduped: dict[str, UsernameDirectoryResult] = {}
     for match in matches:
         deduped[match.path] = match
 
-    return list(deduped.values()), checked_patterns, matched_rel_pattern or rel_pattern
+    return UsernameDirectoryScan(
+        matches=list(deduped.values()),
+        checked_patterns=checked_patterns,
+        rel_pattern=matched_rel_pattern or default_rel_pattern,
+        unavailable_roots=unavailable_roots,
+    )
+
+
+def _search_username_directories(
+    config: UltimaScraperCollectionConfig,
+    usernames: list[str],
+    site_name: str,
+) -> tuple[list[UsernameDirectoryResult], list[str], str]:
+    scan = _scan_username_directories(config, usernames, site_name)
+    return scan.matches, scan.checked_patterns, scan.rel_pattern
 
 
 def find_performer_media_file(
@@ -645,8 +747,8 @@ async def search_username_directories(
     if not all_usernames:
         raise HTTPException(status_code=404, detail="User not found")
 
-    matches, checked_patterns, rel_pattern = await asyncio.to_thread(
-        _search_username_directories,
+    scan = await asyncio.to_thread(
+        _scan_username_directories,
         config,
         all_usernames,
         site.lower(),
@@ -656,11 +758,12 @@ async def search_username_directories(
         success=True,
         username=all_usernames[0],
         site=site.lower(),
-        user_directory_format=rel_pattern,
-        matches=matches,
-        checked_patterns=checked_patterns,
+        user_directory_format=scan.rel_pattern,
+        matches=scan.matches,
+        checked_patterns=scan.checked_patterns,
         usernames_searched=all_usernames,
         resolved_user_id=resolved_user_id,
+        unavailable_roots=scan.unavailable_roots,
     )
 
 
