@@ -118,6 +118,23 @@ def _bounded_ids(rows, max_bytes: int) -> list[int]:
     return selected
 
 
+def _missing_bytes(media):
+    """Bytes of the media not downloaded yet: what a destination must still hold."""
+    return func.coalesce(
+        func.sum(case((media.c.downloaded.is_(True), 0), else_=media.c.size)), 0
+    )
+
+
+def _totals(row) -> dict[str, int]:
+    # bytes: everything selected (progress); missing_bytes: what still needs room.
+    return {
+        "count": int(row[0]),
+        "bytes": int(row[1]),
+        "drm": int(row[2]),
+        "missing_bytes": int(row[3]),
+    }
+
+
 class MediaSelectionStore:
     def __init__(self, session_factory: Callable = global_session):
         self.session_factory = session_factory
@@ -583,11 +600,12 @@ class MediaSelectionStore:
                     func.count(),
                     func.coalesce(func.sum(media.c.size), 0),
                     func.coalesce(func.sum(case((media.c.drm.is_(True), 1), else_=0)), 0),
+                    _missing_bytes(media),
                 )
                 .select_from(Media.__table__.outerjoin(media, media.c.id == Media.media_id))
                 .where(Media.selection_id == selection_id)
             ).one()
-            return {"count": int(row[0]), "bytes": int(row[1]), "drm": int(row[2])}
+            return _totals(row)
 
     def download_totals(self, selection_id, *, user_id, content_type, auth_id):
         from ultima_scraper_db_archive.databases.ultima_archive.schemas.templates import (
@@ -610,6 +628,7 @@ class MediaSelectionStore:
                     func.coalesce(
                         func.sum(case((media.c.drm.is_(True), 1), else_=0)), 0
                     ),
+                    _missing_bytes(media),
                 )
                 .select_from(source)
                 .where(
@@ -618,7 +637,7 @@ class MediaSelectionStore:
                     Media.content_type == content_type,
                 )
             ).one()
-            return {"count": int(row[0]), "bytes": int(row[1]), "drm": int(row[2])}
+            return _totals(row)
 
     def download_page(
         self, selection_id, *, user_id, content_type, auth_id, after, limit, max_bytes

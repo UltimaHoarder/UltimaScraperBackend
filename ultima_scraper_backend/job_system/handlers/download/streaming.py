@@ -301,7 +301,7 @@ async def _download_selected_media(
             site_name=task.site_name,
             user_manager=context.user_manager,
             config=config,
-            required_space=totals["bytes"],
+            required_space=totals.get("missing_bytes", totals["bytes"]),
             ignore_space_requirements=bool(task.payload.ignore_space_requirements),
         )
     manager = DownloadManager(
@@ -427,7 +427,7 @@ async def _download_selected_media(
                     site_name=task.site_name,
                     user_manager=context.user_manager,
                     config=config,
-                    required_space=target_totals["bytes"],
+                    required_space=target_totals.get("missing_bytes", target_totals["bytes"]),
                     ignore_space_requirements=bool(
                         task.payload.ignore_space_requirements
                     ),
