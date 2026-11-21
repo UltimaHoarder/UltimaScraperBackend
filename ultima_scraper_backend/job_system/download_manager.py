@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -69,10 +70,16 @@ class DownloadWorkspace:
     )
     staging_fallback_reason: str | None = None
     reserved_bytes: int = 0
+    # This item's own folder under the staging directory (see _staging_item_directory).
+    item_directory: Path | None = None
 
     @property
     def work_directory(self) -> Path | None:
-        return self.selected_staging_directory or self.drm_temp_directory
+        return (
+            self.item_directory
+            or self.selected_staging_directory
+            or self.drm_temp_directory
+        )
 
     @work_directory.setter
     def work_directory(self, value: Path | None) -> None:
@@ -341,6 +348,19 @@ def _merge_parts_sync(
             logger.warning(
                 "Merged %s but could not clean up %s: %s", dest_path, parts_folder, exc
             )
+
+
+def _staging_item_directory(staging_directory: Path, item: DownloadItem) -> Path:
+    """The item's own folder in a staging directory every worker shares.
+
+    The same media is often in two content types of one job (a post that is also
+    a highlight), and both tasks download it at once. Staged by file name alone
+    they wrote the same ``.download`` file and one renamed it from under the
+    other. The folder is named after the destination, not the run, so a
+    restarted download still finds its finished ranges.
+    """
+    destination = str(item.get_filepath()).encode("utf-8", "surrogateescape")
+    return staging_directory / hashlib.sha256(destination).hexdigest()[:20]
 
 
 def _download_target(workspace_target: Path) -> Path:
@@ -826,12 +846,15 @@ class DownloadManager:
         )
         if selected_directory is not None:
             workspace.work_directory = selected_directory
+            item_directory = _staging_item_directory(selected_directory, item)
+            item_directory.mkdir(parents=True, exist_ok=True)
+            workspace.item_directory = item_directory
             if needed_bytes > 0:
                 workspace.reserved_bytes = needed_bytes
                 self._staging_reserved[selected_directory] = (
                     self._staging_reserved.get(selected_directory, 0) + needed_bytes
                 )
-            return selected_directory
+            return item_directory
 
         workspace.staging_fallback_reason = warning
         if warning:
@@ -845,6 +868,12 @@ class DownloadManager:
     def release_workspace(self, item: DownloadItem) -> None:
         """Return the item's staging reservation once its files have left."""
         workspace = item.drm_media_settings
+        if workspace.item_directory is not None:
+            # Only once empty: a failed download leaves its ranges here to resume.
+            try:
+                workspace.item_directory.rmdir()
+            except OSError:
+                pass
         directory = workspace.selected_staging_directory
         if not workspace.reserved_bytes or directory is None:
             return
