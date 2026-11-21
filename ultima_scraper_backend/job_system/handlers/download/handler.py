@@ -57,6 +57,7 @@ from ...payloads import DownloadTaskPayload
 from ..scrape.events import publish_hook_event
 from ....offload import placement
 from ....offload.client import OffloadError
+from .planner import plan_downloads
 from .results import categorize_media_items, resolve_content_id, use_kept_copies
 from .types import MediaEntry
 from .utils import (
@@ -370,32 +371,25 @@ async def _download_content_batch(
         if destination_selection.requires_full_directory_render
         else destination_selection.absolute_path
     )
-    # Build download items from content metadata, dedup, and apply fresh URLs
-    construction_failures = []
-    download_items = _build_download_items(
+    # Everything that needs no network request: items, kept copies, media other
+    # content already saved (hardlinked), and why the rest are skipped.
+    from ...shared_media import SharedMediaCopies
+
+    shared_copies = getattr(download_manager, "find_existing_copy", None)
+    plan = await asyncio.to_thread(
+        plan_downloads,
         content_metadatas,
         user,
         base_destination,
         dependent_media_entries,
-        failures=construction_failures,
-        directory_format_override=destination_selection.directory_format,
-        render_full_directory_format=destination_selection.requires_full_directory_render,
+        destination_selection=destination_selection,
         download_setup=config.settings.download_setup,
+        shared_copies=shared_copies if isinstance(shared_copies, SharedMediaCopies) else None,
     )
 
-    use_kept_copies(download_items, destination_selection, base_destination)
-
-    # Before any network request: media another post, story or message already
-    # saved is hardlinked (or copied) into place, so it counts as on disk below.
-    from ...shared_media import SharedMediaCopies, reuse_shared_copies
-
-    shared_copies = getattr(download_manager, "find_existing_copy", None)
-    if isinstance(shared_copies, SharedMediaCopies):
-        await asyncio.to_thread(reuse_shared_copies, download_items, shared_copies)
-
-    # Categorize media items by expiry status
-    valid_items, skipped_items = categorize_media_items(download_items)
-    skipped_items.extend(construction_failures)
+    download_items = plan.items
+    construction_failures = plan.construction_failures
+    valid_items, skipped_items = plan.valid_items, plan.skipped_items
     download_results: list[DownloadResultItem] = list(skipped_items)
     if valid_items:
         pass
