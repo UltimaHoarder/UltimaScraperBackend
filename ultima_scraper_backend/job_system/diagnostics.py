@@ -7,7 +7,6 @@ telemetry for proxy routes and network interfaces associated with jobs.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -389,13 +388,11 @@ class ThroughputDiagnosticsCompiler:
 
         # 5. Theoretical capacities
         args = getattr(job, "args", {}) or {}
-        env_concurrency = os.environ.get("ULTIMA_WORKER_CONCURRENCY")
         target_concurrency = int(
             metadata.get("target_concurrency")
             or metadata.get("concurrency")
             or (args.get("target_concurrency") if isinstance(args, dict) else None)
             or (args.get("concurrency") if isinstance(args, dict) else None)
-            or env_concurrency
             or max(1, (int(proxy_capacity) + max(1, worker_pool_size) - 1) // max(1, worker_pool_size))
         )
         worker_concurrency_demand = max(1, worker_pool_size * target_concurrency)

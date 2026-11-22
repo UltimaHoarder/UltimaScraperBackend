@@ -88,10 +88,7 @@ class _ServiceRetry:
 
 def ledger_claim_page_size(batch, configured=None):
     """Claim page from ``worker_pool.claim_batch_size``, capped at the ledger batch."""
-    from ..deprecated_env import deprecated_env_int
-
-    size = deprecated_env_int("ULTIMA_CLAIM_BATCH_SIZE") or configured or batch
-    return min(batch, size)
+    return min(batch, configured or batch)
 
 
 def worker_claim_capacity(pool, active_count, concurrency, batch):

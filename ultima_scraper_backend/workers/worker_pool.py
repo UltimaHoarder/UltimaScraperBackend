@@ -91,7 +91,6 @@ CONTINUABLE_TASK_FAILURE_MAXIMUM = 25
 CONTINUABLE_TASK_FAILURE_PERCENT_DIVISOR = 20  # Five percent of the batch.
 CONTINUABLE_TASK_FAILURE_WINDOW_SECONDS = 60
 DEFAULT_CLAIM_BATCH_SIZE = 8
-CLAIM_BATCH_SIZE_ENV = "ULTIMA_CLAIM_BATCH_SIZE"
 
 
 class APIProtocol(Protocol):
@@ -786,11 +785,7 @@ class Worker:
         Clamped to [1, effective_ceiling] where effective_ceiling is parameterized
         and defaults to a safe file-descriptor boundary (protecting against EMFILE).
         """
-        from ..deprecated_env import deprecated_env_int
-
-        configured = deprecated_env_int(
-            "ULTIMA_WORKER_CONCURRENCY"
-        ) or self._worker_pool_setting("task_concurrency")
+        configured = self._worker_pool_setting("task_concurrency")
         if configured:
             return int(configured)
 
@@ -824,14 +819,8 @@ class Worker:
 
         Defaults to 8 (claiming 5–10 tasks in a single Redis roundtrip),
         clamped to available local concurrency slots so we don't oversubscribe.
-        Configurable via ULTIMA_CLAIM_BATCH_SIZE env var.
         """
-        env_raw = os.environ.get(CLAIM_BATCH_SIZE_ENV)
-        if env_raw and env_raw.strip().isdigit() and int(env_raw) > 0:
-            target_batch = int(env_raw)
-        else:
-            target_batch = DEFAULT_CLAIM_BATCH_SIZE
-        return max(1, min(target_batch, available_slots))
+        return max(1, min(DEFAULT_CLAIM_BATCH_SIZE, available_slots))
 
 
     def _init_db_managers(self) -> None:

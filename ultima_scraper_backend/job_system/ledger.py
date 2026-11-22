@@ -395,7 +395,7 @@ class Limits:
         )
         return cls(
             **resolved,
-            planner_batch=number("ULTIMA_LEDGER_PLANNER_BATCH", planner_default),
+            planner_batch=planner_default,
             archive_batch=number("ULTIMA_LEDGER_ARCHIVE_BATCH", 2048),
             terminal_tasks=number(
                 "ULTIMA_LEDGER_TERMINAL_TASKS", 2 * resolved["global_tasks"]

@@ -200,15 +200,13 @@ def _is_allowed_origin(origin: str, allowed_origins: list[str]) -> bool:
     )
 
 
-def _env_int(name: str, default: int, *, strict: bool = False) -> int:
+def _env_int(name: str, default: int) -> int:
     raw = runtime_env_value(name)
     if raw is None:
         return default
     try:
         return int(raw)
     except (TypeError, ValueError):
-        if strict:
-            raise ValueError(f"{name} must be an integer") from None
         return default
 
 
@@ -430,29 +428,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         await log_redis_memory_guardrail(cast(Any, backend.redis))
 
-        from ..deprecated_env import deprecated_env_int
         from ..services.terminal_job_reconciler import (
             load_job_execution_settings_async,
         )
 
-        # Limits come from job_execution settings; deprecated env vars still
-        # pin individual values for one release.
-        reconciler_overrides = {
-            attribute: value
-            for name, attribute, minimum in (
-                ("USR_TERMINAL_JOB_RECONCILE_INTERVAL_SECONDS", "interval_seconds", 30),
-                ("USR_TERMINAL_JOB_RECONCILE_MIN_AGE_SECONDS", "min_age_seconds", 0),
-                ("USR_TERMINAL_JOB_RECONCILE_BATCH_SIZE", "max_jobs_per_cycle", 1),
-                ("USR_COMPLETED_JOB_RETENTION_SECONDS", "retention_age_seconds", 0),
-                ("USR_COMPLETED_JOB_RETENTION_BATCH_SIZE", "retention_batch_size", 1),
-            )
-            if (value := deprecated_env_int(name, minimum=minimum)) is not None
-        }
+        # Limits come from job_execution settings, read before every cycle.
         _terminal_job_reconciler = TerminalJobReconciler(
             cast(Any, backend.redis),
             settings_loader=load_job_execution_settings_async,
-            overrides=reconciler_overrides.keys(),
-            **reconciler_overrides,
         )
         await _terminal_job_reconciler.start()
         logger.info("Terminal-job Redis reconciler started")

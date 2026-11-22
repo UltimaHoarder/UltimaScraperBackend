@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable
 from typing import Any, Sequence, cast
 
 from ..job_system.manager import JobManager
@@ -62,7 +62,6 @@ class TerminalJobReconciler:
         retention_age_seconds: int = JobStorage.DEFAULT_COMPLETED_JOB_RETENTION_SECONDS,
         retention_batch_size: int = JobStorage.DEFAULT_WRITE_BATCH_SIZE,
         settings_loader: Callable[[], Awaitable[Any | None]] | None = None,
-        overrides: Collection[str] = (),
     ) -> None:
         for name, value, minimum in (
             ("retention_age_seconds", retention_age_seconds, 0),
@@ -79,8 +78,6 @@ class TerminalJobReconciler:
         self.retention_age_seconds = retention_age_seconds
         self.retention_batch_size = retention_batch_size
         self._settings_loader = settings_loader
-        # Attributes fixed by deprecated environment overrides.
-        self._overrides = frozenset(overrides)
         self._scan_cursor = 0
         self._task: asyncio.Task[None] | None = None
         self._deletion_task: asyncio.Task | None = None
@@ -125,8 +122,7 @@ class TerminalJobReconciler:
         if settings is None:
             return
         for field, attribute in _SETTING_ATTRIBUTES.items():
-            if attribute not in self._overrides:
-                setattr(self, attribute, getattr(settings, field))
+            setattr(self, attribute, getattr(settings, field))
 
     async def _run(self) -> None:
         while True:

@@ -46,22 +46,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MPS_GUEST_ROUTE_TIMEOUT_SECONDS = 3.0
 DEFAULT_MPS_GUEST_LOOKUP_TIMEOUT_SECONDS = 3.5
 
-MPS_GUEST_ROUTE_TIMEOUT_SECONDS = float(
-    os.environ.get(
-        "ULTIMA_MPS_GUEST_ROUTE_TIMEOUT",
-        DEFAULT_MPS_GUEST_ROUTE_TIMEOUT_SECONDS,
-    )
-)
 # A 429 benches only the visitor session that hit it (OnlyFans limits each
 # guest session); one more lookup on another session of the same route costs
 # no extra route hop.
 GUEST_SESSION_ATTEMPTS_PER_ROUTE = 2
-MPS_GUEST_LOOKUP_TIMEOUT_SECONDS = float(
-    os.environ.get(
-        "ULTIMA_MPS_GUEST_LOOKUP_TIMEOUT",
-        DEFAULT_MPS_GUEST_LOOKUP_TIMEOUT_SECONDS,
-    )
-)
 MPS_GUEST_ROUTE_MAX_ATTEMPTS = int(
     os.environ.get("ULTIMA_MPS_GUEST_ROUTE_MAX_ATTEMPTS", 3)
 )
@@ -80,7 +68,7 @@ MPS_GUEST_ROUTE_TIMEOUT_DEFER_THRESHOLD = 3
 MPS_GUEST_ROUTE_TIMEOUT_DEFER_SECONDS = 30.0
 MPS_GUEST_PROXY_AUTH_DEFER_SECONDS = 300.0
 # Backward-compatibility alias
-MPS_GUEST_LOOKUP_ROUTE_TIMEOUT_SECONDS = MPS_GUEST_LOOKUP_TIMEOUT_SECONDS
+MPS_GUEST_LOOKUP_ROUTE_TIMEOUT_SECONDS = DEFAULT_MPS_GUEST_LOOKUP_TIMEOUT_SECONDS
 
 
 # ULTIMA_MPS_GUEST_PERMIT_BEFORE_TIMEOUT=1: an MPS lookup takes its proxy's
@@ -95,11 +83,11 @@ def _resolve_mps_guest_lookup_timeout(
     context: TaskRunContext | None = None,
     route_proxy_url: str | None = None,
 ) -> float:
-    """Resolve the guest lookup timeout from config settings, env var, or default.
+    """Resolve the guest lookup timeout from config settings, or default.
 
     Checks the proxy's own override, then its group's
     (network.proxy_groups[proxy.group]), then global network.guest_lookup_timeout,
-    then the ULTIMA_MPS_GUEST_LOOKUP_TIMEOUT environment variable, and defaults to 3.5s.
+    and defaults to 3.5s.
     """
     if context is not None:
         cfg = getattr(context, "config", None)
@@ -121,22 +109,13 @@ def _resolve_mps_guest_lookup_timeout(
             if configured is not None:
                 return configured
 
-    return float(
-        os.environ.get(
-            "ULTIMA_MPS_GUEST_LOOKUP_TIMEOUT",
-            DEFAULT_MPS_GUEST_LOOKUP_TIMEOUT_SECONDS,
-        )
-    )
+    return DEFAULT_MPS_GUEST_LOOKUP_TIMEOUT_SECONDS
 
 
 def _resolve_mps_guest_route_timeout(
     context: TaskRunContext | None = None,
 ) -> float:
-    """Resolve the guest route timeout from config settings, env var, or default.
-
-    Checks global network.guest_route_timeout, then the ULTIMA_MPS_GUEST_ROUTE_TIMEOUT
-    environment variable, and defaults to 3.0s.
-    """
+    """Resolve the guest route timeout from network.guest_route_timeout, else 3.0s."""
     if context is not None:
         cfg = getattr(context, "config", None)
         if cfg is None and hasattr(context, "context") and isinstance(context.context, dict):
@@ -147,12 +126,7 @@ def _resolve_mps_guest_route_timeout(
             if global_timeout is not None and global_timeout > 0:
                 return float(global_timeout)
 
-    return float(
-        os.environ.get(
-            "ULTIMA_MPS_GUEST_ROUTE_TIMEOUT",
-            DEFAULT_MPS_GUEST_ROUTE_TIMEOUT_SECONDS,
-        )
-    )
+    return DEFAULT_MPS_GUEST_ROUTE_TIMEOUT_SECONDS
 
 
 def _proxy_log_label(raw_proxy_url: str | None) -> str:
