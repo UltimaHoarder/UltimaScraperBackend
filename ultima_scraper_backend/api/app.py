@@ -81,6 +81,7 @@ from .routes import (
     jobs,
     media,
     mps,
+    object_storage,
     offload,
     orders,
     proxies,
@@ -678,6 +679,7 @@ app.include_router(database_browser.router, prefix="/api/v1")
 app.include_router(files.router, prefix="/api/v1")
 app.include_router(server_restore.router, prefix="/api/v1")
 app.include_router(media.router, prefix="/api/v1")
+app.include_router(object_storage.router, prefix="/api/v1")
 app.include_router(system.router, prefix="/api/v1")
 app.include_router(cluster.router, prefix="/api/v1")
 app.include_router(consolidation.router, prefix="/api/v1")

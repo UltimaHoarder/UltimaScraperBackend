@@ -1123,6 +1123,30 @@ async def _remote_thumbnail_source_is_reachable(
     return False
 
 
+async def resolve_local_media_file(
+    site_name: str,
+    media_id: int,
+    config: UltimaScraperCollectionConfig,
+) -> Path | None:
+    """The media's file on this backend's disk, or None (never a remote copy)."""
+
+    site = _normalized_site(site_name)
+    try:
+        context = await asyncio.to_thread(
+            _get_site_media_resolution_context,
+            site,
+            media_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return None
+        raise
+    file_path = await _resolve_stored_media_file(context, config, site)
+    if file_path is None:
+        file_path = await _resolve_configured_media_file(context, config, site)
+    return file_path
+
+
 @router.get("/stream/{site_name}/{media_id}", response_model=None)
 async def stream_local_media(
     site_name: str,

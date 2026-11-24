@@ -33,6 +33,7 @@ dependencies = [
     "psycopg[binary]>=3.3,<4",
     "greenlet>=3.2,<4",
     "uvloop>=0.21; sys_platform != 'win32'",
+    "boto3>=1.35,<2",
 ]
 
 [project.urls]
