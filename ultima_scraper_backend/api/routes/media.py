@@ -14,7 +14,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Iterable, cast
+from typing import Annotated, Any, AsyncGenerator, Iterable, cast
 from urllib.parse import urlparse
 
 import aiohttp
@@ -1129,13 +1129,17 @@ async def stream_local_media(
     media_id: int,
     config: UltimaScraperCollectionConfig = Depends(get_config),
     backend_manager: BackendManager = Depends(get_backend_manager),
+    local_only: Annotated[
+        bool,
+        Query(description="Serve only a file on disk; 404 instead of fetching it from the site"),
+    ] = False,
 ) -> FileResponse | StreamingResponse:
     """Stream a downloaded media file from local storage.
 
     Serves an existing local file first so browsers receive the correct MIME
     type and byte-range support needed for MP4/WebM playback. If no local
     file can be resolved, falls back to proxying the remote ``media.url``
-    through the backend's authenticated session.
+    through the backend's authenticated session, unless ``local_only`` is set.
     """
 
     site = _normalized_site(site_name)
@@ -1163,6 +1167,9 @@ async def stream_local_media(
     file_path = await _resolve_configured_media_file(context, config, site)
     if file_path is not None:
         return local_file_response(file_path)
+
+    if local_only:
+        raise HTTPException(status_code=404, detail="File not found on disk")
 
     remote_candidates = _iter_remote_stream_candidates(media)
     drm_candidate = await _resolve_drm_stream_candidate(
